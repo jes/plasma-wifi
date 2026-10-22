@@ -88,6 +88,17 @@ pub fn run(mut draw: impl FnMut(&mut egui::Ui)) -> Result<()> {
     let utf8 = atom(b"UTF8_STRING")?;
     let targets = atom(b"TARGETS")?;
     let paste_property = atom(b"PLASMA_WIFI_PASTE")?;
+    let mut icons = Vec::new();
+    for size in [32, 64] {
+        icons.extend(window_icon(size));
+    }
+    conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        atom(b"_NET_WM_ICON")?,
+        AtomEnum::CARDINAL,
+        &icons,
+    )?;
     conn.change_property32(
         PropMode::REPLACE,
         window,
@@ -102,6 +113,7 @@ pub fn run(mut draw: impl FnMut(&mut egui::Ui)) -> Result<()> {
         .get_keyboard_mapping(setup.min_keycode, setup.max_keycode - setup.min_keycode + 1)?
         .reply()?;
     let ctx = egui::Context::default();
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("native_window"), window));
     ctx.set_pixels_per_point(1.0);
     let mut renderer = EguiSoftwareRender::new(ColorFieldOrder::Bgra);
     let mut pixels = Vec::<[u8; 4]>::new();
@@ -329,6 +341,49 @@ pub fn run(mut draw: impl FnMut(&mut egui::Ui)) -> Result<()> {
         thread::sleep(Duration::from_millis(33).saturating_sub(frame_start.elapsed()));
     }
     Ok(())
+}
+
+fn window_icon(size: u32) -> Vec<u32> {
+    let mut out = vec![size, size];
+    let bolt = [
+        (36.0, 8.0),
+        (17.0, 35.0),
+        (30.0, 35.0),
+        (26.0, 56.0),
+        (47.0, 26.0),
+        (34.0, 26.0),
+    ];
+    for y in 0..size {
+        for x in 0..size {
+            let (x, y) = (
+                (x as f32 + 0.5) * 64.0 / size as f32,
+                (y as f32 + 0.5) * 64.0 / size as f32,
+            );
+            let mut inside = false;
+            let mut previous = bolt[bolt.len() - 1];
+            for &(a, b) in &bolt {
+                if (b > y) != (previous.1 > y)
+                    && x < (previous.0 - a) * (y - b) / (previous.1 - b) + a
+                {
+                    inside = !inside;
+                }
+                previous = (a, b);
+            }
+            let r = (x - 32.0).hypot(y - 32.0);
+            let wave = x > 42.0 && y < 28.0 && ((r - 24.0).abs() < 2.0 || (r - 15.0).abs() < 2.0);
+            let corner = (x.clamp(16.0, 48.0) - x).hypot(y.clamp(16.0, 48.0) - y);
+            out.push(if inside {
+                0xffffb95a
+            } else if wave {
+                0xff4bd3df
+            } else if corner < 14.0 {
+                0xff141a23
+            } else {
+                0
+            });
+        }
+    }
+    out
 }
 
 fn modifiers(mask: KeyButMask) -> Modifiers {

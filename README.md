@@ -11,7 +11,7 @@ chmod +x plasma-wifi
 ./plasma-wifi
 ```
 
-The executable is statically linked with musl. It needs an X11 display, or XWayland on a Wayland desktop. It does not load host glibc, libX11, GTK, Qt, or OpenGL. Rendering and bundled fonts are built into the binary.
+The executable is statically linked with musl. It needs an X11 display, or XWayland on a Wayland desktop. It does not load host glibc, libX11, GTK, Qt, or OpenGL. Rendering, the window icon, and bundled fonts are built into the binary. File selection uses the desktop portal, with zenity/kdialog as fallbacks on older desktops; these are separate desktop services, with no GTK/Qt libraries linked or loaded by the app. A desktop needs one of those existing file-picker services for the Open button; passing a filename on the command line also works.
 
 The default controller is `192.168.0.1:23`, with HTTP on port 80. Change these in Settings or use:
 
@@ -25,18 +25,21 @@ Install the supplied `config.yaml` through the FluidNC WebUI before using active
 
 - Open a G-code file with **Open G-code** or **Ctrl+O**. Processing, uploading, and verification happen automatically. The header shows progress and whether the file is verified. **Run** starts it explicitly.
 - Jog using held on-screen buttons or arrow keys. The speed is in mm/min. Keyboard jogging is suppressed in text fields and dialogs, and ends on key release or focus loss. Short jog segments require a continuing UI heartbeat.
+- **Trace hull at jog speed** follows the job’s convex hull using torch-off XY jog moves at the selected speed, closes the outline, then returns to the starting work position. The preview’s **Hull** checkbox shows that outline. Use **Cancel hull trace** or **Stop** to cancel. Tracing requires an idle machine with the torch off and cannot overlap a job, upload, or manual jog. It includes rapid travel as well as feed moves, including the approach from the current position; arc samples include exact X/Y extrema. Connection loss cancels the trace without replaying it; an in-flight jog may continue until cancellation reaches the controller. This is a physical travel check: the app does not know the machine’s mechanical limits.
 - **X0**, **Y0**, and **/2** change work coordinates without moving. Click a DRO number, edit it, and press **Enter** to apply. The app uses `G54` and `G10 L20 P1` for work offsets; displayed coordinates are always millimetres.
 - Feed controls adjust the controller's realtime feed override. Pierce dwell is unaffected.
 - Set pierce delay in **Settings**. Applying a change regenerates and uploads the loaded job. The original file is never edited.
-- **Pause** holds motion, then extinguishes a lit torch. **Resume** restores it only if it was lit, waits the configured delay while motion remains held, then resumes. **Stop** soft-resets the controller, aborting motion and extinguishing the torch. A later Run starts the file again from the beginning.
+- **Pause** holds motion, then extinguishes a lit torch. **Resume** restores it only if it was lit, waits the configured delay while motion remains held, then resumes. **Stop** holds motion, extinguishes the torch, then soft-resets the controller after the hold completes. This avoids the `ALARM:3` that FluidNC raises when reset interrupts motion. Pressing Stop again forces an immediate reset; a hold timeout also falls back to reset. Genuine alarms remain visible until the controller leaves Alarm, and are retained in the console history. A later Run starts the file again from the beginning.
+- **Console** shows FluidNC commands and responses separately from the internal **Log**. Type a command and press **Enter** or **Send**; **Up/Down** recalls command history. Status reports can be shown or hidden. Ordinary commands require Idle/Alarm, because the LocalFS Run acknowledgement is deferred until the file finishes; `?`, `!`, and `~` remain available during jobs and use the app’s pause/resume behavior.
+- DRO and override updates use 100 ms controller auto reports, plus a refresh after acknowledged commands and realtime overrides. A slower heartbeat checks that the connection is still alive.
 - The G-code panel switches between original and uploaded lines. Inserted pierce dwells are marked. Auto-scroll follows the active motion line; FluidNC may omit line numbers during a dwell or between planner blocks, so the most recent known line remains highlighted.
-- The preview distinguishes rapid moves, torch-on cuts, the active segment, and completed segments. Drag to pan, wheel to zoom, and **Fit** to reset the view.
+- The preview uses subdued cyan rapid moves, prominent orange feed moves, and distinct active/completed segments. Drag to pan, wheel to zoom, and **Fit** to reset the view.
 
 Files cannot be replaced during running or paused jobs. Run is gated on verified contents and fresh idle controller status. Reconnection queries state without replaying Run, coordinate writes, or jogs. Elapsed time is marked uncertain after a connection gap because an unobserved pause or override change cannot be reconstructed exactly.
 
 ## G-code and timing
 
-The processor handles linear moves, XY `G2/G3` arcs with I/J or signed R, full circles with explicit X/Y endpoints, helical Z coordinates, arc P rotations, G20/G21 units, G90/G91 positioning, G91.1 incremental arc centers, G94 feed, G4 dwell, G53 machine moves, G54, common FreeCAD Grbl preamble words, M3/M5, and M2/M30. Source numerical precision is preserved. Combined ignition/motion blocks are split so the inserted pierce dwell happens before motion. Original line numbers are replaced and mapped to their source lines.
+The processor handles linear moves, XY `G2/G3` arcs with I/J or signed R, full circles with explicit X/Y endpoints, helical Z coordinates, arc P rotations, G20/G21 units, G90/G91 positioning, G91.1 incremental arc centers, G94 feed, G4 dwell, G53 machine moves, G54, common FreeCAD Grbl preamble words, M3/M5, and M2/M30. Positional words (`X/Y/Z/I/J/K/R`) are rounded to at most three decimal places in the file’s units, trailing zeroes are removed, and G codes use canonical numbers (`G00` → `G0`, `G01` → `G1`). Geometry and timing use those same rounded values. Feed, spindle, and dwell precision is retained. FreeCAD’s unused `K0` on XY arcs is accepted, as it is by FluidNC. Combined ignition/motion blocks are split so the inserted pierce dwell happens before motion. Original line numbers are replaced and mapped to their source lines.
 
 The UI has no Z controls. Existing Z commands are retained and explicitly flagged, so a milling post's retract moves are never silently deleted. Use an XY/plasma CAM setup for this machine. Unsupported coordinate systems, planes, expressions, probing, canned cycles, and other unmodelled commands produce a source-line error and are not uploaded. FreeCAD's Grbl post normally disables tool-length compensation; leave it disabled. A representative Grbl preamble is covered by the parser tests.
 
@@ -61,9 +64,9 @@ To explore without hardware:
 ./dist/plasma-wifi --demo
 ```
 
-Demo starts a loopback-only TCP/HTTP simulator, loads the rounded-plate example, and does not save settings. The simulator supports upload, verification, motion, hold/restore, overrides, jogs, work offsets, and connection drops. Automated tests cover controller interactions against it; this is separate from testing a physical cutter.
+Demo starts a loopback-only TCP/HTTP simulator, loads the rounded-plate example, and does not save settings. The simulator supports upload, verification, motion, hold/restore, sparse status fields, auto reports, overrides, absolute/relative jogs, work offsets, reset-during-motion alarms, and connection drops. Automated tests cover controller interactions against it; this is separate from testing a physical cutter.
 
-The GUI smoke check additionally needs Xvfb, xdotool, Python Pillow and python-xlib on the development machine:
+The GUI smoke check additionally needs Xvfb, xdotool, xclip, zenity, Python Pillow and python-xlib on the development machine:
 
 ```sh
 xvfb-run -a -s '-screen 0 1280x900x24' python3 scripts/ui_smoke.py

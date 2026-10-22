@@ -1,6 +1,7 @@
 mod app;
 mod controller;
 mod desktop;
+mod file_dialog;
 mod gcode;
 mod protocol;
 mod simulator;

@@ -22,6 +22,8 @@ struct Machine {
     wco: Point,
     torch: bool,
     held: bool,
+    hold_until: Option<Instant>,
+    alarm: Option<u8>,
     override_stopped: bool,
     feed: f64,
     rapid: f64,
@@ -30,11 +32,21 @@ struct Machine {
     inches: bool,
     disconnect_generation: u64,
     pub commands: Vec<String>,
+    report_count: u64,
+    report_wco: Point,
+    report_feed: f64,
+    report_torch: bool,
 }
 impl Machine {
     fn state(&self) -> &str {
-        if self.held {
-            "Hold:0"
+        if self.alarm.is_some() {
+            "Alarm"
+        } else if self.held {
+            if self.hold_until.is_some_and(|until| until > Instant::now()) {
+                "Hold:1"
+            } else {
+                "Hold:0"
+            }
         } else if self.jog_until.is_some_and(|t| t > Instant::now()) {
             "Jog"
         } else if self.program.is_some() {
@@ -43,7 +55,35 @@ impl Machine {
             "Idle"
         }
     }
-    fn status(&self) -> String {
+    fn status(&mut self, auto: bool) -> String {
+        let periodic = self.report_count.is_multiple_of(10);
+        self.report_count += 1;
+        let wco = if periodic || auto && self.report_wco != self.wco {
+            self.report_wco = self.wco;
+            let scale = if self.inches { 25.4 } else { 1.0 };
+            format!(
+                "|WCO:{:.4},{:.4},{:.4}",
+                self.wco.x / scale,
+                self.wco.y / scale,
+                self.wco.z / scale
+            )
+        } else {
+            String::new()
+        };
+        let overrides = if periodic
+            || auto && (self.report_feed != self.feed || self.report_torch != self.torch)
+        {
+            self.report_feed = self.feed;
+            self.report_torch = self.torch;
+            format!(
+                "|Ov:{:.0},{:.0},100{}",
+                self.feed * 100.0,
+                self.rapid * 100.0,
+                if self.torch { "|A:S" } else { "" }
+            )
+        } else {
+            String::new()
+        };
         let line = self
             .program
             .as_ref()
@@ -60,19 +100,13 @@ impl Machine {
         };
         let scale = if self.inches { 25.4 } else { 1.0 };
         format!(
-            "<{}|MPos:{:.4},{:.4},{:.4}|WCO:{:.4},{:.4},{:.4}{line}|FS:{},{}|Ov:{:.0},{:.0},100{}{file}>\n",
+            "<{}|MPos:{:.4},{:.4},{:.4}{wco}{line}|FS:{},{}{overrides}{file}>\n",
             self.state(),
             (self.position.x + self.wco.x) / scale,
             (self.position.y + self.wco.y) / scale,
             (self.position.z + self.wco.z) / scale,
-            self.wco.x / scale,
-            self.wco.y / scale,
-            self.wco.z / scale,
             if self.state() == "Run" { 1200 } else { 0 },
             if self.torch { 1 } else { 0 },
-            self.feed * 100.0,
-            self.rapid * 100.0,
-            if self.torch { "|A:S" } else { "" }
         )
     }
     fn tick(&mut self, dt: f64) {
@@ -111,6 +145,10 @@ impl Machine {
     }
     fn command(&mut self, command: &str) -> String {
         self.commands.push(command.into());
+        if command == "$X" {
+            self.alarm = None;
+            return "ok\n".into();
+        }
         if command == "$report_inches" {
             return format!("$/report_inches={}\nok\n", self.inches);
         }
@@ -156,8 +194,23 @@ impl Machine {
             if self.program.is_some() || self.held {
                 return "error:8\n".into();
             }
-            self.position.x += word(command, 'X').unwrap_or(0.0);
-            self.position.y += word(command, 'Y').unwrap_or(0.0);
+            if self.alarm.is_some() {
+                return "error:9\n".into();
+            }
+            for axis in ['X', 'Y'] {
+                if let Some(value) = word(command, axis) {
+                    let coordinate = if axis == 'X' {
+                        &mut self.position.x
+                    } else {
+                        &mut self.position.y
+                    };
+                    if command.contains("G90") {
+                        *coordinate = value;
+                    } else {
+                        *coordinate += value;
+                    }
+                }
+            }
             self.jog_until = Some(Instant::now() + Duration::from_millis(140));
         }
         if command.starts_with("G10L20P1") {
@@ -249,15 +302,25 @@ impl Simulator {
 fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_millis(20)))?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
-    let generation = state.lock().unwrap().disconnect_generation;
+    let generation = {
+        let mut m = state.lock().unwrap();
+        m.report_count = 0;
+        m.disconnect_generation
+    };
     stream.write_all(b"Grbl 4.1 [FluidNC v4.1.1 simulator]\n")?;
     let mut buffer = [0u8; 2048];
     let mut line = Vec::new();
+    let mut interval = None;
+    let mut last_report = Instant::now();
     loop {
         {
             let mut m = state.lock().unwrap();
             if m.disconnect_generation != generation {
                 return Ok(());
+            }
+            if interval.is_some_and(|interval| last_report.elapsed() >= interval) {
+                stream.write_all(m.status(interval.is_some()).as_bytes())?;
+                last_report = Instant::now();
             }
             if m.complete {
                 stream.write_all(b"ok\n")?;
@@ -280,9 +343,12 @@ fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()
         for &byte in &buffer[..count] {
             let mut m = state.lock().unwrap();
             match byte {
-                b'?' => stream.write_all(m.status().as_bytes())?,
+                b'?' => stream.write_all(m.status(interval.is_some()).as_bytes())?,
                 b'!' => {
-                    m.held = true;
+                    if matches!(m.state(), "Run" | "Jog") {
+                        m.held = true;
+                        m.hold_until = Some(Instant::now() + Duration::from_millis(100));
+                    }
                 }
                 b'~' => {
                     m.held = false;
@@ -298,13 +364,22 @@ fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()
                     }
                 }
                 0x18 => {
+                    let abort = matches!(m.state(), "Run" | "Jog" | "Hold:1");
+                    if abort {
+                        m.alarm = Some(3);
+                    }
                     m.program = None;
                     m.held = false;
                     m.torch = false;
                     m.override_stopped = false;
                     m.jog_until = None;
                     line.clear();
+                    interval = None;
+                    m.report_count = 0;
                     stream.write_all(b"Grbl 4.1 [FluidNC v4.1.1 simulator]\n")?;
+                    if abort {
+                        stream.write_all(b"ALARM:3\n")?;
+                    }
                 }
                 0x85 => {
                     m.jog_until = None;
@@ -318,6 +393,12 @@ fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()
                 b'\n' => {
                     let command = String::from_utf8_lossy(&line).trim().to_owned();
                     line.clear();
+                    if let Some(value) = command
+                        .strip_prefix("$Report/Interval=")
+                        .and_then(|v| v.parse::<u64>().ok())
+                    {
+                        interval = (value > 0).then(|| Duration::from_millis(value));
+                    }
                     stream.write_all(m.command(&command).as_bytes())?;
                 }
                 b'\r' => {}
@@ -369,7 +450,7 @@ fn http_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()> 
     let path = parts.next().unwrap_or("");
     let mut m = state.lock().unwrap();
     let (code, content, body) = if path == "/sim/status" {
-        (200,"application/json",serde_json::to_vec(&json!({"state":m.state(),"x":m.position.x,"y":m.position.y,"mpos_x":m.position.x+m.wco.x,"mpos_y":m.position.y+m.wco.y,"torch":m.torch,"commands":m.commands,"file":m.file})).unwrap())
+        (200,"application/json",serde_json::to_vec(&json!({"state":m.state(),"x":m.position.x,"y":m.position.y,"mpos_x":m.position.x+m.wco.x,"mpos_y":m.position.y+m.wco.y,"torch":m.torch,"feed_override":m.feed,"alarm":m.alarm,"commands":m.commands,"file":m.file})).unwrap())
     } else if path == "/sim/disconnect" && method == "POST" {
         m.disconnect_generation += 1;
         (200, "application/json", b"{}".to_vec())
@@ -575,5 +656,165 @@ mod tests {
         let s = wait(&controller, |s| s.phase == "Completed");
         assert!(!s.job);
         assert_eq!(s.progress, 1.0);
+    }
+    #[test]
+    fn hull_trace_is_closed_xy_only_torch_off_and_returns_to_start() {
+        let sim = Simulator::start().unwrap();
+        let controller = Controller::start(sim.address.clone(), sim.http.clone());
+        wait(&controller, |s| s.initialized && s.status.position_known);
+        controller.send(Action::SetCoordinate {
+            axis: 'X',
+            value: 3.0,
+        });
+        wait(&controller, |s| {
+            (s.status.wpos.x - 3.0).abs() < 0.001 && s.status.position_known
+        });
+        controller.send(Action::SetCoordinate {
+            axis: 'Y',
+            value: 4.0,
+        });
+        wait(&controller, |s| {
+            (s.status.wpos.y - 4.0).abs() < 0.001 && s.status.position_known
+        });
+        controller.send(Action::Load {
+            name: "hull.nc".into(),
+            text: "G21G90\nG0X10Y0\nM3S1\nG1X10Y10F600\nX5Y5\nX0Y10\nM5\nM30".into(),
+            pierce: 0.1,
+        });
+        wait(&controller, |s| s.can_run());
+        let start = controller.snapshot().status.wpos;
+        controller.send(Action::TraceHull { speed: 777.0 });
+        let tracing = wait(&controller, |s| s.tracing);
+        assert!(!tracing.can_run() && !tracing.can_jog());
+        let done = wait(&controller, |s| s.phase == "Hull trace complete");
+        assert!(!done.status.torch);
+        assert!(done.status.wpos.distance(start) < 0.001);
+        let commands = sim.commands();
+        let jogs: Vec<_> = commands.iter().filter(|c| c.starts_with("$J=")).collect();
+        assert_eq!(jogs.len(), 6); // four hull vertices, close, return
+        for command in &jogs {
+            assert!(command.starts_with("$J=G21G90X") && command.ends_with("F777.0"));
+            assert!(!command.contains('Z') && !command.contains("M3"));
+        }
+        assert!(jogs.iter().any(|c| c.contains("X10.000Y10.000")));
+        assert!(!commands.iter().any(|c| c.starts_with("$LocalFS/Run=")));
+        controller.send(Action::TraceHull { speed: 600.0 });
+        wait(&controller, |s| s.tracing && s.status.state == "Jog");
+        controller.send(Action::CancelTrace);
+        wait(&controller, |s| !s.tracing && s.status.idle());
+        let count = sim.commands().len();
+        thread::sleep(Duration::from_millis(350));
+        assert_eq!(
+            count,
+            sim.commands().len(),
+            "Trace must not resume after cancellation"
+        );
+    }
+    #[test]
+    fn console_is_separate_and_updates_dro_and_override_promptly() {
+        let sim = Simulator::start().unwrap();
+        let controller = Controller::start(sim.address.clone(), sim.http.clone());
+        wait(&controller, |s| s.initialized && s.status.position_known);
+        let started = Instant::now();
+        controller.send(Action::Console("G10L20P1X42".into()));
+        let changed = wait(&controller, |s| (s.status.wpos.x - 42.0).abs() < 0.001);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(changed.console.iter().any(|l| l == "> G10L20P1X42"));
+        assert!(changed.console.iter().any(|l| l == "ok"));
+        assert!(
+            !changed
+                .log
+                .iter()
+                .any(|l| l.contains("G10L20P1X42") || l == "ok")
+        );
+        let started = Instant::now();
+        controller.send(Action::Feed(0x91));
+        wait(&controller, |s| {
+            (s.status.feed_override - 1.1).abs() < 0.001
+        });
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+    #[test]
+    fn normal_stop_avoids_abort_alarm_and_unlock_clears_alarm_message() {
+        let sim = Simulator::start().unwrap();
+        let controller = Controller::start(sim.address.clone(), sim.http.clone());
+        wait(&controller, |s| s.initialized && s.status.position_known);
+        controller.send(Action::Load {
+            name: "stop.nc".into(),
+            text: "G21G90\nM3S1\nG1X100F600\nM5\nM30".into(),
+            pierce: 0.0,
+        });
+        wait(&controller, |s| s.can_run());
+        controller.send(Action::Run);
+        wait(&controller, |s| s.status.state == "Run" && s.status.torch);
+        controller.send(Action::Console("$G".into()));
+        wait(&controller, |s| {
+            s.error
+                .as_ref()
+                .is_some_and(|e| e.contains("Ordinary console commands"))
+        });
+        assert!(
+            controller.snapshot().job,
+            "A rejected console command must not end a job"
+        );
+        controller.send(Action::Stop);
+        wait(&controller, |s| s.initialized && !s.job && s.status.idle());
+        assert!(sim.machine.lock().unwrap().alarm.is_none());
+        assert!(!controller.snapshot().console.iter().any(|l| l == "ALARM:3"));
+        // The simulator also models the old immediate-reset failure case.
+        wait(&controller, |s| s.can_run());
+        controller.send(Action::Run);
+        wait(&controller, |s| s.status.state == "Run");
+        controller.send(Action::Stop);
+        controller.send(Action::Stop); // repeated Stop is an immediate reset fallback
+        let alarm = wait(&controller, |s| {
+            s.alarm.as_deref() == Some("ALARM:3") && !s.status.torch
+        });
+        assert!(!alarm.status.torch);
+        wait(&controller, |s| s.initialized && s.status.state == "Alarm");
+        controller.send(Action::Unlock);
+        let unlocked = wait(&controller, |s| s.status.idle());
+        assert!(unlocked.alarm.is_none());
+    }
+    #[test]
+    fn hull_trace_rejects_lit_torch_and_never_restarts_after_reconnect() {
+        let sim = Simulator::start().unwrap();
+        let controller = Controller::start(sim.address.clone(), sim.http.clone());
+        wait(&controller, |s| s.initialized && s.status.position_known);
+        controller.send(Action::Load {
+            name: "trace.nc".into(),
+            text: "G21G90\nG0X10\nG1Y10F600\nX0\nY0\nM30".into(),
+            pierce: 0.0,
+        });
+        wait(&controller, |s| s.can_run());
+        sim.machine.lock().unwrap().torch = true;
+        wait(&controller, |s| s.status.torch);
+        controller.send(Action::TraceHull { speed: 600.0 });
+        let rejected = wait(&controller, |s| {
+            s.error.as_ref().is_some_and(|e| e.contains("torch off"))
+        });
+        assert!(!rejected.tracing);
+        assert!(!sim.commands().iter().any(|c| c.starts_with("$J=")));
+        sim.machine.lock().unwrap().torch = false;
+        wait(&controller, |s| !s.status.torch);
+        controller.send(Action::TraceHull { speed: 600.0 });
+        wait(&controller, |s| s.tracing && s.status.state == "Jog");
+        sim.disconnect();
+        let disconnected = wait(&controller, |s| !s.connected);
+        assert!(!disconnected.tracing);
+        let count = sim
+            .commands()
+            .iter()
+            .filter(|c| c.starts_with("$J="))
+            .count();
+        let reconnected = wait(&controller, |s| s.initialized && s.status.idle());
+        assert!(!reconnected.tracing);
+        assert_eq!(
+            count,
+            sim.commands()
+                .iter()
+                .filter(|c| c.starts_with("$J="))
+                .count()
+        );
     }
 }

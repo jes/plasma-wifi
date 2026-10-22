@@ -1,10 +1,16 @@
 use crate::{
     controller::{Action, Controller, Snapshot},
-    gcode::Point,
+    gcode::{Point, Program},
 };
 use egui::{Color32, Pos2, RichText, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        mpsc::{Receiver, TryRecvError},
+    },
+};
 
 const CYAN: Color32 = Color32::from_rgb(75, 211, 223);
 const GREEN: Color32 = Color32::from_rgb(110, 220, 160);
@@ -72,10 +78,19 @@ pub struct App {
     auto_scroll: bool,
     last_active: Option<usize>,
     scroll_to_active: bool,
-    chooser: bool,
-    chooser_path: String,
+    picker: Option<Receiver<anyhow::Result<Option<PathBuf>>>>,
+    native_window: u32,
     settings_open: bool,
     log_open: bool,
+    console_open: bool,
+    console_input: String,
+    console_history: Vec<String>,
+    console_index: usize,
+    console_draft: String,
+    console_status: bool,
+    show_hull: bool,
+    hull_points: Vec<Point>,
+    hull_program: Option<Arc<Program>>,
     error: Option<String>,
     was_jogging: bool,
     zoom: f32,
@@ -96,10 +111,19 @@ impl App {
             auto_scroll: true,
             last_active: None,
             scroll_to_active: false,
-            chooser: false,
-            chooser_path: String::new(),
+            picker: None,
+            native_window: 0,
             settings_open: false,
             log_open: false,
+            console_open: false,
+            console_input: String::new(),
+            console_history: Vec::new(),
+            console_index: 0,
+            console_draft: String::new(),
+            console_status: false,
+            show_hull: false,
+            hull_points: Vec::new(),
+            hull_program: None,
             error: None,
             was_jogging: false,
             zoom: 1.0,
@@ -127,7 +151,6 @@ impl App {
                 });
                 self.zoom = 1.0;
                 self.pan = Vec2::ZERO;
-                self.chooser = false;
                 self.error = None;
             }
             Err(e) => self.error = Some(format!("{}: {e}", path.display())),
@@ -142,13 +165,43 @@ impl App {
     }
     pub fn ui(&mut self, root: &mut egui::Ui) {
         self.snapshot = self.controller.snapshot();
+        if let Some(program) = &self.snapshot.program
+            && !self
+                .hull_program
+                .as_ref()
+                .is_some_and(|old| Arc::ptr_eq(old, program))
+        {
+            self.hull_points = program.hull();
+            self.hull_program = Some(program.clone());
+        }
+        self.native_window = root
+            .ctx()
+            .data(|d| d.get_temp(egui::Id::new("native_window")))
+            .unwrap_or(0);
+        if let Some(picker) = &self.picker {
+            match picker.try_recv() {
+                Ok(result) => {
+                    self.picker = None;
+                    match result {
+                        Ok(Some(path)) => self.open(path),
+                        Ok(None) => {}
+                        Err(error) => self.error = Some(format!("{error:#}")),
+                    }
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.picker = None;
+                    self.error = Some("System file chooser exited unexpectedly".into());
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         let ctx = root.ctx().clone();
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::from_rgb(20, 26, 35);
         visuals.window_fill = Color32::from_rgb(26, 34, 45);
         visuals.selection.bg_fill = Color32::from_rgb(25, 100, 115);
         ctx.set_visuals(visuals);
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::O)) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::O)) {
             self.open_chooser();
         }
         egui::Panel::top("header").show_inside(root, |ui| {
@@ -165,12 +218,18 @@ impl App {
                     if ui.button("Settings").clicked() {
                         self.settings_open = true;
                     }
+                    if ui.button("Console").clicked() {
+                        self.console_open = !self.console_open;
+                    }
                     if ui.button("Log").clicked() {
                         self.log_open = !self.log_open;
                     }
                     if ui
                         .add_enabled(
-                            !self.snapshot.job && !self.snapshot.transferring,
+                            !self.snapshot.job
+                                && !self.snapshot.tracing
+                                && !self.snapshot.transferring
+                                && self.picker.is_none(),
                             egui::Button::new("Open G-code…  Ctrl+O"),
                         )
                         .clicked()
@@ -211,7 +270,11 @@ impl App {
                     ui.small(format!("LocalFS: {free}"));
                 }
             });
-            let error = self.error.as_ref().or(self.snapshot.error.as_ref());
+            let error = self
+                .error
+                .as_ref()
+                .or(self.snapshot.alarm.as_ref())
+                .or(self.snapshot.error.as_ref());
             if let Some(error) = error {
                 ui.colored_label(RED, error);
             }
@@ -235,6 +298,9 @@ impl App {
         let state = &self.snapshot.status.state;
         if !self.snapshot.connected {
             return ("DISCONNECTED".into(), RED);
+        }
+        if self.snapshot.tracing {
+            return ("TRACING HULL".into(), CYAN);
         }
         if state.starts_with("Hold") {
             return ("PAUSED".into(), ORANGE);
@@ -260,7 +326,7 @@ impl App {
             && self.snapshot.status.idle()
             && !self.snapshot.job
             && self.snapshot.status.position_known;
-        let can_set = can_set && !self.snapshot.transferring;
+        let can_set = can_set && !self.snapshot.transferring && !self.snapshot.tracing;
         let position = self.snapshot.status.wpos;
         for (i, axis, value) in [(0, 'X', position.x), (1, 'Y', position.y)] {
             if !self.dro_edit[i] {
@@ -469,12 +535,37 @@ impl App {
             ui.label("Pierce delay");
             ui.label(format!("{:.3} s", self.applied_pierce));
         });
+        if self.snapshot.tracing {
+            if ui.button("Cancel hull trace").clicked() {
+                self.controller.send(Action::CancelTrace);
+            }
+        } else if ui
+            .add_enabled(
+                self.snapshot.can_jog()
+                    && self.snapshot.status.idle()
+                    && self.snapshot.program.is_some()
+                    && !self.snapshot.status.torch,
+                egui::Button::new("Trace hull at jog speed"),
+            )
+            .on_hover_text("Follow the job's convex hull with the torch off, then return here")
+            .clicked()
+        {
+            self.show_hull = true;
+            self.controller.send(Action::TraceHull {
+                speed: self.settings.jog_speed,
+            });
+        }
     }
     fn jog_input(&mut self, ctx: &egui::Context) {
         let pointer = ctx
             .data(|d| d.get_temp::<Option<(f64, f64)>>(egui::Id::new("pointer_jog")))
             .flatten();
-        let direction = if !ctx.input(|i| i.focused) || self.chooser || self.settings_open {
+        let direction = if !ctx.input(|i| i.focused)
+            || self.picker.is_some()
+            || self.settings_open
+            || self.console_open
+            || self.log_open
+        {
             None
         } else if pointer.is_some() {
             pointer
@@ -510,12 +601,13 @@ impl App {
     fn preview(&mut self, ui: &mut egui::Ui, height: f32) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("TOOLPATH").color(CYAN).strong());
-            ui.small("Cut / torch on");
-            ui.colored_label(ORANGE, "Rapid");
+            ui.colored_label(ORANGE, "Feed / cut");
+            ui.colored_label(CYAN, "Rapid");
             if ui.button("Fit").clicked() {
                 self.zoom = 1.0;
                 self.pan = Vec2::ZERO;
             }
+            ui.checkbox(&mut self.show_hull, "Hull");
             ui.small("Wheel: zoom · drag: pan");
         });
         let (response, painter) =
@@ -622,16 +714,34 @@ impl App {
             } else if completed {
                 Color32::from_rgb(65, 100, 110)
             } else if block.rapid {
-                ORANGE
-            } else if block.torch {
                 CYAN
             } else {
-                Color32::from_rgb(110, 135, 150)
+                ORANGE
             };
             for points in block.path.windows(2) {
                 painter.line_segment(
                     [project(points[0]), project(points[1])],
-                    Stroke::new(if active { 2.8_f32 } else { 1.5_f32 }, color),
+                    Stroke::new(
+                        if active {
+                            2.8_f32
+                        } else if block.rapid {
+                            1.0_f32
+                        } else {
+                            1.5_f32
+                        },
+                        color,
+                    ),
+                );
+            }
+        }
+        if self.show_hull && self.hull_points.len() >= 2 {
+            for i in 0..self.hull_points.len() {
+                painter.line_segment(
+                    [
+                        project(self.hull_points[i]),
+                        project(self.hull_points[(i + 1) % self.hull_points.len()]),
+                    ],
+                    Stroke::new(1.0_f32, Color32::from_gray(210)),
                 );
             }
         }
@@ -744,86 +854,20 @@ impl App {
         });
     }
     fn open_chooser(&mut self) {
-        if !self.snapshot.job && !self.snapshot.transferring {
-            self.chooser = true;
-            self.chooser_path = self.settings.last_dir.to_string_lossy().into();
+        if !self.snapshot.job
+            && !self.snapshot.tracing
+            && !self.snapshot.transferring
+            && self.picker.is_none()
+        {
+            self.controller.send(Action::CancelJog);
+            self.picker = Some(crate::file_dialog::open(
+                self.settings.last_dir.clone(),
+                self.native_window,
+            ));
         }
     }
     fn dialogs(&mut self, root: &mut egui::Ui) {
         let ctx = root.ctx().clone();
-        if self.chooser {
-            let mut open = true;
-            let mut selected = None;
-            egui::Window::new("Open G-code — uploads automatically")
-                .open(&mut open)
-                .default_width(640.0)
-                .show(&ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Path");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.chooser_path).desired_width(450.0),
-                        );
-                        if ui.button("Open").clicked() {
-                            selected = Some(PathBuf::from(&self.chooser_path));
-                        }
-                    });
-                    let path = PathBuf::from(&self.chooser_path);
-                    let directory = if path.is_dir() {
-                        path.clone()
-                    } else {
-                        path.parent().unwrap_or(&self.settings.last_dir).to_owned()
-                    };
-                    if ui.button("↑ Parent folder").clicked()
-                        && let Some(parent) = directory.parent()
-                    {
-                        self.chooser_path = parent.to_string_lossy().into();
-                    }
-                    egui::ScrollArea::vertical()
-                        .max_height(370.0)
-                        .show(ui, |ui| match std::fs::read_dir(&directory) {
-                            Ok(entries) => {
-                                let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
-                                entries.sort_by_key(|e| (!e.path().is_dir(), e.file_name()));
-                                for entry in entries {
-                                    let path = entry.path();
-                                    let dir = path.is_dir();
-                                    let name = entry.file_name().to_string_lossy().into_owned();
-                                    if name.starts_with('.') {
-                                        continue;
-                                    }
-                                    if ui
-                                        .selectable_label(
-                                            false,
-                                            format!(
-                                                "{}{}",
-                                                if dir { "[folder] " } else { "" },
-                                                name
-                                            ),
-                                        )
-                                        .clicked()
-                                    {
-                                        if dir {
-                                            self.chooser_path = path.to_string_lossy().into();
-                                        } else {
-                                            selected = Some(path);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                ui.colored_label(RED, e.to_string());
-                            }
-                        });
-                });
-            self.chooser = open;
-            if let Some(path) = selected {
-                if path.is_dir() {
-                    self.chooser_path = path.to_string_lossy().into();
-                } else {
-                    self.open(path);
-                }
-            }
-        }
         if self.settings_open {
             let mut open = true;
             let mut apply = false;
@@ -834,7 +878,7 @@ impl App {
                 });
                 ui.horizontal(|ui|{ui.label("Pierce delay");ui.add(egui::DragValue::new(&mut self.settings.pierce).range(0.0..=60.0).speed(0.05).suffix(" s"));});
                 ui.small("Applied to every ignition and torch restoration on Resume.");
-                if ui.add_enabled(!self.snapshot.job && !self.snapshot.transferring,egui::Button::new("Apply settings")).clicked(){apply=true;}
+                if ui.add_enabled(!self.snapshot.job && !self.snapshot.tracing && !self.snapshot.transferring,egui::Button::new("Apply settings")).clicked(){apply=true;}
                 ui.small("Changing pierce delay automatically regenerates and uploads the loaded job.");
             });
             self.settings_open = open;
@@ -865,8 +909,11 @@ impl App {
                 }
             }
         }
+        if self.console_open {
+            self.console_dialog(&ctx);
+        }
         if self.log_open {
-            egui::Window::new("Controller log")
+            egui::Window::new("Application log")
                 .open(&mut self.log_open)
                 .default_size([700.0, 300.0])
                 .show(&ctx, |ui| {
@@ -879,6 +926,74 @@ impl App {
                         });
                 });
         }
+    }
+    fn console_dialog(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        egui::Window::new("FluidNC console")
+            .open(&mut open)
+            .default_size([760.0, 420.0])
+            .show(ctx, |ui| {
+                ui.checkbox(&mut self.console_status, "Show status reports");
+                egui::ScrollArea::both()
+                    .id_salt("console_output")
+                    .max_height((ui.available_height() - 65.0).max(80.0))
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &self.snapshot.console {
+                            if self.console_status || !line.starts_with('<') {
+                                let text = RichText::new(line).monospace();
+                                ui.add(egui::Label::new(text).selectable(true));
+                            }
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut self.console_input)
+                            .desired_width((ui.available_width() - 65.0).max(100.0))
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text("FluidNC command"),
+                    );
+                    if field.has_focus() || field.lost_focus() {
+                        if ui.input(|i| i.key_pressed(egui::Key::ArrowUp))
+                            && self.console_index > 0
+                        {
+                            if self.console_index == self.console_history.len() {
+                                self.console_draft = self.console_input.clone();
+                            }
+                            self.console_index -= 1;
+                            self.console_input = self.console_history[self.console_index].clone();
+                        }
+                        if ui.input(|i| i.key_pressed(egui::Key::ArrowDown))
+                            && self.console_index < self.console_history.len()
+                        {
+                            self.console_index += 1;
+                            self.console_input = self.console_history
+                                .get(self.console_index).cloned()
+                                .unwrap_or_else(|| self.console_draft.clone());
+                        }
+                    }
+                    let submit = field.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let submit = ui.button("Send").clicked() || submit;
+                    if submit && !self.console_input.trim().is_empty() {
+                        let command = self.console_input.trim().to_owned();
+                        if command == "?" {
+                            self.console_status = true;
+                        }
+                        self.console_history.push(command.clone());
+                        if self.console_history.len() > 100 {
+                            self.console_history.remove(0);
+                        }
+                        self.console_index = self.console_history.len();
+                        self.console_input.clear();
+                        self.console_draft.clear();
+                        self.controller.send(Action::Console(command));
+                        field.request_focus();
+                    }
+                });
+                ui.small("Enter sends · Up/Down recall · ordinary commands need Idle/Alarm; ? ! ~ work during jobs");
+            });
+        self.console_open = open;
     }
 }
 fn duration(seconds: f64) -> String {

@@ -36,7 +36,10 @@ successfully uploaded and verified. If disconnected, show that the file is await
 
 It can do some preprocessing to strip out comments, unnecessary spaces, etc. to make the program as short as possible but it *must not*
 inadvertently change the behaviour of the program because nobody wants to have to debug that.
-The deliberate exception is insertion of the configured pierce delay after torch ignition, as described below.
+The deliberate exceptions are insertion of the configured pierce delay after torch ignition and rounding positional words
+(X/Y/Z/I/J/K/R) to no more than three decimal places in the file’s units. Strip trailing zeroes and unnecessary leading
+zeroes on G codes: emit G0, G1, G2, etc. Preview and timing must use the same rounded coordinates as the upload.
+Accept FreeCAD’s unused K0 on XY arcs, matching FluidNC 4.1.1; this is not a drilling-cycle command.
 
 The CAM package is not yet decided. Compatibility with FreeCAD CAM's Grbl postprocessor is an expected baseline. Support G2/G3 arcs
 as well as linear moves, and track modal state correctly for processing, preview and timing. Most files will use millimetres and
@@ -105,3 +108,19 @@ the gcode to set the N numbers, no big deal.
 Try to auto-reconnect to the socket if disconnected.
 
 Check file size after uploading, and potentially verify file contents if quick and easy to do.
+
+## Second iteration
+
+Use the system file chooser rather than a custom in-app browser, while retaining portable static deployment. Give the
+window a taskbar/toolbar icon. Separate the application log from a FluidNC console, and allow typed commands in that
+console with command history. Console pause/resume must preserve the torch and pierce-delay behavior above.
+
+DRO and feed override feedback should update promptly, using regular controller reports and refreshes after changes.
+Give feed moves a more prominent preview color than rapids. Clear the current alarm message after the controller leaves
+Alarm; retain historical alarm messages in the console. A normal Stop should hold first, then reset after motion stops,
+to avoid FluidNC’s reset-during-motion ALARM:3. Do not automatically unlock genuine alarms.
+
+Add a physical convex-hull trace of the loaded job, like UGS Platform: follow its closed XY outline at the current jog
+speed with the torch off, as a sanity check of physical travel before cutting. Show the hull in the preview. Include the
+job’s rapid travel and arc extrema. Return to the starting position after the outline. Allow cancellation, and prohibit
+tracing during a running or paused job, uploading, or manual jogging. Tracing must not execute the file or ignite the torch.

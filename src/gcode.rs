@@ -115,6 +115,50 @@ pub struct Program {
     pub max_uploaded_columns: usize,
 }
 
+impl Program {
+    pub fn hull(&self) -> Vec<Point> {
+        let mut points: Vec<_> = self
+            .blocks
+            .iter()
+            .flat_map(|b| b.path.iter())
+            .map(|p| Point {
+                x: p.x,
+                y: p.y,
+                z: 0.0,
+            })
+            .collect();
+        points.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+        points.dedup_by(|a, b| a.x == b.x && a.y == b.y);
+        if points.len() < 3 {
+            return points;
+        }
+        let cross =
+            |a: Point, b: Point, c: Point| (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        let mut lower = Vec::new();
+        for &point in &points {
+            while lower.len() >= 2
+                && cross(lower[lower.len() - 2], lower[lower.len() - 1], point) <= 0.0
+            {
+                lower.pop();
+            }
+            lower.push(point);
+        }
+        let mut upper = Vec::new();
+        for &point in points.iter().rev() {
+            while upper.len() >= 2
+                && cross(upper[upper.len() - 2], upper[upper.len() - 1], point) <= 0.0
+            {
+                upper.pop();
+            }
+            upper.push(point);
+        }
+        lower.pop();
+        upper.pop();
+        lower.extend(upper);
+        lower
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ParseOptions {
     pub pierce_seconds: f64,
@@ -160,7 +204,7 @@ struct Word {
     text: String,
 }
 
-/// Only remove lexical comments/whitespace; never round or rewrite source numbers.
+/// Compact words before analysis so the preview and timing match the uploaded coordinates.
 fn words(line: &str) -> Result<Vec<Word>> {
     let mut clean = String::new();
     let mut depth = 0;
@@ -214,15 +258,27 @@ fn words(line: &str) -> Result<Vec<Word>> {
         }
         ensure!(i > start, "missing number after {letter}");
         let number: String = chars[start..i].iter().collect();
-        let value: f64 = number
+        let mut value: f64 = number
             .parse()
             .with_context(|| format!("invalid number {number}"))?;
         ensure!(value.is_finite(), "non-finite number");
         if letter != 'N' {
+            let text = if matches!(letter, 'X' | 'Y' | 'Z' | 'I' | 'J' | 'K' | 'R') {
+                let rounded = format!("{value:.3}");
+                value = rounded.parse()?;
+                let compact = rounded.trim_end_matches('0').trim_end_matches('.');
+                // Only strip trailing zeroes after the decimal point, never integer zeroes.
+                let compact = if value == 0.0 { "0" } else { compact };
+                format!("{letter}{compact}")
+            } else if letter == 'G' {
+                format!("G{value}")
+            } else {
+                format!("{letter}{number}")
+            };
             out.push(Word {
                 letter,
                 value,
-                text: format!("{letter}{number}"),
+                text,
             });
         }
     }
@@ -338,7 +394,7 @@ impl Parser {
         let next_spindle = !m5 && (m3 || self.spindle);
         let ignition = next_spindle && next_speed > 0.0 && (!self.spindle || self.speed <= 0.0);
         let has_motion = w.iter().any(|w| {
-            matches!(w.letter, 'X' | 'Y' | 'Z' | 'I' | 'J' | 'R')
+            matches!(w.letter, 'X' | 'Y' | 'Z' | 'I' | 'J' | 'K' | 'R')
                 || w.letter == 'G' && (0.0..=4.0).contains(&w.value)
         });
         if ignition && has_motion {
@@ -377,7 +433,7 @@ impl Parser {
             return Ok(());
         }
         let get = |letter| w.iter().find(|w| w.letter == letter).map(|w| w.value);
-        for letter in "XYZIJRFPST".chars() {
+        for letter in "XYZIJKRFPST".chars() {
             ensure!(
                 w.iter().filter(|w| w.letter == letter).count() <= 1,
                 "duplicate {letter} word"
@@ -429,7 +485,7 @@ impl Parser {
                         word.value
                     ),
                 },
-                'X' | 'Y' | 'Z' | 'I' | 'J' | 'R' | 'F' | 'P' | 'S' | 'T' => {}
+                'X' | 'Y' | 'Z' | 'I' | 'J' | 'K' | 'R' | 'F' | 'P' | 'S' | 'T' => {}
                 _ => bail!("{} words are not supported", word.letter),
             }
         }
@@ -471,8 +527,11 @@ impl Parser {
                 || matches!(self.motion, 2 | 3) && (get('I').is_some() || get('J').is_some()));
         ensure!(
             matches!(self.motion, 2 | 3)
-                || get('I').is_none() && get('J').is_none() && get('R').is_none(),
-            "I/J/R words require an arc motion"
+                || get('I').is_none()
+                    && get('J').is_none()
+                    && get('K').is_none()
+                    && get('R').is_none(),
+            "I/J/K/R words require an arc motion"
         );
         if dwell {
             time.dwell = get('P').context("G4 requires a P duration in seconds")?;
@@ -495,7 +554,8 @@ impl Parser {
                     "FluidNC arcs require an X or Y word, including full circles"
                 );
                 ensure!(
-                    get('R').is_none() || get('I').is_none() && get('J').is_none(),
+                    get('R').is_none()
+                        || get('I').is_none() && get('J').is_none() && get('K').is_none(),
                     "arc cannot combine R and I/J"
                 );
                 let center = if let Some(r) = get('R') {
@@ -530,8 +590,21 @@ impl Parser {
                     as usize)
                     .clamp(2, 20000);
                 let a0 = (start.y - center.y).atan2(start.x - center.x);
-                for step in 0..=segments {
-                    let t = step as f64 / segments as f64;
+                let mut fractions: Vec<f64> = (0..=segments)
+                    .map(|step| step as f64 / segments as f64)
+                    .collect();
+                // Include exact XY extrema so a hull trace reaches the full axis extents,
+                // even when an arc's ordinary tessellation misses a cardinal angle.
+                let end_angle = a0 + angle;
+                let quarter = std::f64::consts::FRAC_PI_2;
+                for k in (a0.min(end_angle) / quarter).ceil() as i64
+                    ..=(a0.max(end_angle) / quarter).floor() as i64
+                {
+                    fractions.push(((k as f64 * quarter - a0) / angle).clamp(0.0, 1.0));
+                }
+                fractions.sort_by(f64::total_cmp);
+                fractions.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+                for t in fractions {
                     path.push(Point {
                         x: center.x + r * (a0 + angle * t).cos(),
                         y: center.y + r * (a0 + angle * t).sin(),
@@ -662,12 +735,12 @@ mod tests {
         parse(s, ParseOptions::default()).unwrap()
     }
     #[test]
-    fn preserves_precision_and_maps_inserted_lines() {
+    fn rounds_uploaded_coordinates_and_maps_inserted_lines() {
         let p = program("(FreeCAD)\nN10 G21 G90\n M3 S1 ; torch\nG1 X1.234567890 F60\nM5\n");
         assert_eq!(p.blocks[2].code, "G4P0.5");
         assert_eq!(p.blocks[2].source, 2);
-        assert!(p.uploaded.contains("N4G1X1.234567890F60\n"));
-        assert!((p.total.feed - 1.234567890).abs() < 1e-9);
+        assert!(p.uploaded.contains("N4G1X1.235F60\n"));
+        assert!((p.total.feed - 1.235).abs() < 1e-9);
         assert_eq!(p.total.dwell, 0.5);
     }
     #[test]
@@ -768,5 +841,39 @@ mod tests {
             progress > 0.98,
             "Repeated arc positions must not return progress to the first turn"
         );
+    }
+    #[test]
+    fn freecad_xy_arcs_accept_unused_k() {
+        let p = program(include_str!("../examples/freecad-lead-in.nc"));
+        assert!(p.uploaded.contains("I-2.121J-2.121K0F1500.000"));
+        assert!((p.blocks.last().unwrap().path.last().unwrap().x - 19.9).abs() < 1e-9);
+        assert!(parse("G1X1K0F60", ParseOptions::default()).is_err());
+        assert!(parse("G81X1Z-1R2F60", ParseOptions::default()).is_err());
+    }
+    #[test]
+    fn compact_positions_and_g_codes_keep_other_precision() {
+        let p = program(
+            "G021G090\nG00X100.00001Y-0.00001Z5.123456\nG01X101.23456F60.123456\nG04P0.123456",
+        );
+        assert_eq!(p.blocks[0].code, "G21G90");
+        assert_eq!(p.blocks[1].code, "G0X100Y0Z5.123");
+        assert_eq!(p.blocks[2].code, "G1X101.235F60.123456");
+        assert_eq!(p.blocks[3].code, "G4P0.123456");
+        assert_eq!(p.blocks[2].path.last().unwrap().x, 101.235);
+    }
+    #[test]
+    fn convex_hull_removes_interior_points_and_includes_arc_extrema() {
+        let p = program("G0X10Y0\nG1X10Y10F600\nX5Y5\nX0Y10\nX0Y0");
+        let hull = p.hull();
+        assert_eq!(hull.len(), 4);
+        assert!(!hull.iter().any(|p| p.x == 5.0 && p.y == 5.0));
+        let p = program("G0X7Y1\nG3X7Y1I-2J-1F600");
+        let hull = p.hull();
+        let radius = 5.0f64.sqrt();
+        assert!(
+            (hull.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max) - (5.0 + radius)).abs()
+                < 1e-9
+        );
+        assert!((hull.iter().map(|p| p.y).fold(f64::INFINITY, f64::min) + radius).abs() < 1e-9);
     }
 }

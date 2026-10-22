@@ -1,5 +1,5 @@
 use crate::{
-    gcode::{self, ParseOptions, Program, TimeParts},
+    gcode::{self, ParseOptions, Point, Program, TimeParts},
     protocol::{self, Link, Status},
 };
 use anyhow::{Result, ensure};
@@ -25,6 +25,11 @@ pub enum Action {
     Resume,
     Stop,
     Unlock,
+    Console(String),
+    TraceHull {
+        speed: f64,
+    },
+    CancelTrace,
     Feed(u8),
     Jog {
         x: f64,
@@ -55,6 +60,9 @@ pub struct Snapshot {
     pub free: Option<String>,
     pub error: Option<String>,
     pub log: VecDeque<String>,
+    pub console: VecDeque<String>,
+    pub alarm: Option<String>,
+    pub tracing: bool,
     pub job: bool,
     pub phase: String,
     pub elapsed: f64,
@@ -81,6 +89,9 @@ impl Default for Snapshot {
             free: None,
             error: None,
             log: VecDeque::new(),
+            console: VecDeque::new(),
+            alarm: None,
+            tracing: false,
             job: false,
             phase: String::new(),
             elapsed: 0.0,
@@ -107,6 +118,7 @@ impl Snapshot {
             && self.ready
             && !self.job
             && !self.transferring
+            && !self.tracing
     }
     pub fn can_jog(&self) -> bool {
         self.connected
@@ -114,6 +126,7 @@ impl Snapshot {
             && self.status.fresh()
             && !self.job
             && !self.transferring
+            && !self.tracing
             && (self.status.idle() || self.status.state == "Jog")
     }
     fn log(&mut self, text: impl Into<String>) {
@@ -122,6 +135,54 @@ impl Snapshot {
             self.log.pop_front();
         }
     }
+    fn console(&mut self, text: impl Into<String>) {
+        self.console.push_back(text.into());
+        while self.console.len() > 1000 {
+            self.console.pop_front();
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct QueuedCommand {
+    text: String,
+    manual: bool,
+}
+impl From<String> for QueuedCommand {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            manual: false,
+        }
+    }
+}
+impl From<&str> for QueuedCommand {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+impl std::ops::Deref for QueuedCommand {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+impl std::fmt::Display for QueuedCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.text.fmt(f)
+    }
+}
+impl PartialEq<&str> for QueuedCommand {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+struct Trace {
+    points: Vec<Point>,
+    next: usize,
+    sent: Option<Instant>,
+    speed: f64,
 }
 
 pub struct Controller {
@@ -244,8 +305,8 @@ struct Worker {
     shared: Arc<Mutex<Snapshot>>,
     s: Snapshot,
     link: Option<Link>,
-    queue: VecDeque<String>,
-    pending: Option<(String, Instant)>,
+    queue: VecDeque<QueuedCommand>,
+    pending: Option<(QueuedCommand, Instant)>,
     reconnect: Instant,
     poll: Instant,
     transfer: Option<Receiver<Transfer>>,
@@ -266,6 +327,10 @@ struct Worker {
     lost_at: Option<(Instant, bool)>,
     selected_work_system: bool,
     reset_wait: Option<Instant>,
+    auto_reports: bool,
+    stopping: Option<Instant>,
+    trace: Option<Trace>,
+    cancel_trace_on_connect: bool,
 }
 impl Worker {
     fn new(
@@ -308,6 +373,10 @@ impl Worker {
             lost_at: None,
             selected_work_system: false,
             reset_wait: None,
+            auto_reports: false,
+            stopping: None,
+            trace: None,
+            cancel_trace_on_connect: false,
         }
     }
     fn run(mut self) {
@@ -352,6 +421,10 @@ impl Worker {
                 match Link::connect(&self.address) {
                     Ok(link) => {
                         self.link = Some(link);
+                        if self.cancel_trace_on_connect {
+                            let _ = self.realtime(&[protocol::JOG_CANCEL]);
+                            self.cancel_trace_on_connect = false;
+                        }
                         self.s.connected = true;
                         self.s.status = Status::default();
                         self.s.status.state = "Connecting".into();
@@ -362,6 +435,7 @@ impl Worker {
                         self.queue.clear();
                         self.pending = None;
                         self.queue.push_back("$report_inches".into());
+                        self.queue.push_back("$Report/Interval=100".into());
                         self.queue.push_back("$I".into());
                         self.need_verify = self.s.program.is_some() && !self.need_upload;
                         self.preview_dirty = true;
@@ -376,6 +450,12 @@ impl Worker {
                 self.disconnected(format!("{e:#}"));
             }
             if let Err(e) = self.advance_pause() {
+                self.fail(format!("{e:#}"));
+            }
+            if let Err(e) = self.advance_stop() {
+                self.fail(format!("{e:#}"));
+            }
+            if let Err(e) = self.advance_trace() {
                 self.fail(format!("{e:#}"));
             }
             if let Err(e) = self.advance_jog() {
@@ -413,6 +493,12 @@ impl Worker {
         if self.s.connected && self.s.job {
             self.lost_at = Some((Instant::now(), self.s.status.state == "Run"));
         }
+        if self.s.tracing {
+            let _ = self.realtime(&[protocol::JOG_CANCEL]);
+            self.cancel_trace_on_connect = true;
+            self.s
+                .log("Hull trace cancelled by disconnection; it will not restart");
+        }
         self.link = None;
         self.s.connected = false;
         self.s.initialized = false;
@@ -423,6 +509,10 @@ impl Worker {
         self.queue.clear();
         self.pending = None;
         self.jog = None;
+        self.trace = None;
+        self.s.tracing = false;
+        self.stopping = None;
+        self.auto_reports = false;
         self.s.status.at = None;
         self.reset_wait = None;
         if self.s.job {
@@ -442,13 +532,26 @@ impl Worker {
         self.reconcile_pause = !matches!(self.pause, PauseState::None);
     }
     fn realtime(&mut self, bytes: &[u8]) -> Result<()> {
-        self.link.as_mut().context_link()?.send(bytes)
+        self.link.as_mut().context_link()?.send(bytes)?;
+        for &byte in bytes {
+            if byte != b'?' {
+                self.s.console(match byte {
+                    protocol::HOLD => "> ! (feed hold)".into(),
+                    protocol::RESUME => "> ~ (cycle start)".into(),
+                    protocol::RESET => "> 0x18 (soft reset)".into(),
+                    protocol::JOG_CANCEL => "> 0x85 (cancel jog)".into(),
+                    protocol::TORCH_TOGGLE => "> 0x9e (torch override)".into(),
+                    _ => format!("> 0x{byte:02x} (realtime override)"),
+                });
+            }
+        }
+        Ok(())
     }
     fn network(&mut self) -> Result<()> {
         let Some(link) = &mut self.link else {
             return Ok(());
         };
-        if self.poll.elapsed() > Duration::from_millis(200) {
+        if self.poll.elapsed() > Duration::from_millis(if self.auto_reports { 1000 } else { 100 }) {
             link.send(b"?")?;
             self.poll = Instant::now();
         }
@@ -479,14 +582,14 @@ impl Worker {
             anyhow::bail!("Controller handshake timed out");
         }
         if self.pending.as_ref().is_some_and(|(cmd, t)| {
-            !cmd.starts_with("$LocalFS/Run=") && t.elapsed() > Duration::from_secs(5)
+            !cmd.manual && !cmd.starts_with("$LocalFS/Run=") && t.elapsed() > Duration::from_secs(5)
         }) {
             anyhow::bail!("Controller command timed out; it will not be repeated");
         }
         if self.pending.is_none() {
             if let Some(command) = self.queue.pop_front() {
                 self.link.as_mut().unwrap().command(&command)?;
-                self.s.log(format!("> {command}"));
+                self.s.console(format!("> {command}"));
                 self.pending = Some((command, Instant::now()));
             } else if self.init_started && self.got_units && self.s.status.fresh() {
                 if !self.selected_work_system && self.s.status.idle() && !self.s.job {
@@ -506,6 +609,7 @@ impl Worker {
         Ok(())
     }
     fn line(&mut self, line: &str) -> Result<()> {
+        self.s.console(line);
         if line.starts_with('<') {
             // Status positions cannot be interpreted until Report/Inches is known.
             if !self.got_units {
@@ -513,6 +617,9 @@ impl Worker {
             }
             let previous_state = self.s.status.state.clone();
             self.s.status.update(line, self.inches);
+            if !self.s.status.state.contains("Alarm") {
+                self.s.alarm = None;
+            }
             if self.reconcile_job && self.s.status.at.is_some() {
                 if let Some((lost, was_running)) = self.lost_at.take()
                     && was_running
@@ -590,8 +697,10 @@ impl Worker {
             }
             return Ok(());
         }
-        self.s.log(line);
         if line.starts_with("Grbl ") && (self.s.initialized || self.reset_wait.is_some()) {
+            self.trace = None;
+            self.s.tracing = false;
+            self.stopping = None;
             self.reset_wait = None;
             self.s.ready = false;
             self.s.job = false;
@@ -602,7 +711,9 @@ impl Worker {
             self.init_started = false;
             self.selected_work_system = false;
             self.got_units = false;
+            self.auto_reports = false;
             self.queue.push_back("$report_inches".into());
+            self.queue.push_back("$Report/Interval=100".into());
             self.queue.push_back("$I".into());
             self.need_verify = self.s.program.is_some();
         }
@@ -676,11 +787,29 @@ impl Worker {
                     self.realtime(&[protocol::RESET])?;
                     self.s.job = false;
                 }
+                if cmd.starts_with("$J=") && self.s.tracing {
+                    self.trace = None;
+                    self.s.tracing = false;
+                    self.s.phase = "Hull trace failed".into();
+                }
                 if cmd.starts_with("G10") {
                     self.s.status.position_known = false;
                 }
             } else if cmd.starts_with("$LocalFS/Run=") {
                 self.finish();
+            }
+            if line == "ok" {
+                if cmd == "$Report/Interval=100" {
+                    self.auto_reports = true;
+                }
+                // Refresh promptly after any acknowledged write, rather than waiting
+                // for the ordinary heartbeat. Auto reports also force changed WCO/Ov fields.
+                self.realtime(b"?")?;
+                self.poll = Instant::now();
+                if cmd.manual {
+                    self.preview_dirty = true;
+                    self.queue.push_back("$G".into());
+                }
             }
             if cmd == "$I" && !self.init_started {
                 self.init_started = true;
@@ -696,7 +825,18 @@ impl Worker {
             }
         }
         if line.starts_with("ALARM:") {
-            self.fail(line.into());
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|(cmd, _)| cmd.starts_with("$LocalFS/Run=") || cmd.starts_with("$J="))
+            {
+                self.pending = None;
+            }
+            self.trace = None;
+            self.s.tracing = false;
+            self.queue.retain(|cmd| !cmd.starts_with("$J="));
+            self.s.alarm = Some(line.into());
+            self.s.status.state = "Alarm".into();
             self.s.job = false;
             self.pause = PauseState::None;
         }
@@ -717,7 +857,7 @@ impl Worker {
         match action {
             Action::Load { name, text, pierce } => {
                 ensure!(
-                    !self.s.job && self.transfer.is_none(),
+                    !self.s.job && !self.s.tracing && self.transfer.is_none(),
                     "Cannot replace a running, paused or uploading job"
                 );
                 ensure!(
@@ -791,6 +931,7 @@ impl Worker {
                 self.s.phase = "Holding motion…".into();
             }
             Action::Resume => {
+                ensure!(self.stopping.is_none(), "Wait for Stop to finish");
                 ensure!(
                     self.s.connected && self.s.status.held(),
                     "Wait for motion to be fully held"
@@ -814,20 +955,33 @@ impl Worker {
                 }
             }
             Action::Stop => {
-                self.realtime(&[protocol::RESET])?;
-                self.s.job = false;
-                self.pause = PauseState::None;
+                if self.stopping.is_some() {
+                    self.reset_controller()?;
+                    return Ok(());
+                }
+                let jogging = self.s.tracing || self.jog.is_some() || self.s.status.state == "Jog";
+                self.trace = None;
+                self.s.tracing = false;
                 self.jog = None;
-                self.s.ready = false;
                 self.queue.clear();
-                self.pending = None;
-                self.s.initialized = false;
-                self.init_started = false;
-                self.selected_work_system = false;
-                self.got_units = false;
-                self.reset_wait = Some(Instant::now());
-                self.s.phase = "Stopped".into();
-                self.need_verify = self.s.program.is_some();
+                if self.s.status.state.contains("Alarm") {
+                    self.reset_controller()?;
+                } else {
+                    // The last report may still say Hold:0 just after Resume. Always
+                    // request a stop and require a newer report before resetting.
+                    self.realtime(&[if jogging {
+                        protocol::JOG_CANCEL
+                    } else {
+                        protocol::HOLD
+                    }])?;
+                    self.pause = if jogging {
+                        PauseState::None
+                    } else {
+                        PauseState::Holding
+                    };
+                    self.stopping = Some(Instant::now());
+                    self.s.phase = "Stopping…".into();
+                }
             }
             Action::Unlock => {
                 ensure!(
@@ -842,6 +996,8 @@ impl Worker {
                     "Invalid override"
                 );
                 self.realtime(&[byte])?;
+                self.realtime(b"?")?;
+                self.poll = Instant::now();
             }
             Action::Jog { x, y, speed } => {
                 ensure!(
@@ -864,7 +1020,7 @@ impl Worker {
                 self.preview_dirty = true;
             }
             Action::CancelJog => {
-                if self.jog.take().is_some() || self.s.status.state == "Jog" {
+                if !self.s.tracing && (self.jog.take().is_some() || self.s.status.state == "Jog") {
                     self.queue.retain(|c| !c.starts_with("$J="));
                     self.realtime(&[protocol::JOG_CANCEL])?;
                 }
@@ -875,7 +1031,8 @@ impl Worker {
                         && self.s.initialized
                         && self.s.status.fresh()
                         && self.s.status.idle()
-                        && !self.s.job,
+                        && !self.s.job
+                        && !self.s.tracing,
                     "Coordinates can only be changed while idle"
                 );
                 ensure!(
@@ -889,7 +1046,8 @@ impl Worker {
                 // G10 L20 sets the work offset at the current physical position. Explicit
                 // G21 avoids interpreting a displayed millimetre value as inches.
                 self.queue.push_back("G21G54".into());
-                self.queue.push_back(format!("G10L20P1{axis}{value:.6}"));
+                self.queue
+                    .push_back(format!("G10L20P1{axis}{value:.6}").into());
                 self.queue.push_back("$G".into());
                 self.s.status.wco_known = false;
                 self.s.status.position_known = false;
@@ -897,7 +1055,7 @@ impl Worker {
             }
             Action::Connect { address, http } => {
                 ensure!(
-                    !self.s.job && self.transfer.is_none(),
+                    !self.s.job && !self.s.tracing && self.transfer.is_none(),
                     "Cannot change controller during a job or upload"
                 );
                 ensure!(
@@ -908,6 +1066,107 @@ impl Worker {
                 self.http = http.trim_end_matches('/').into();
                 self.disconnected("Connection settings changed".into());
                 self.reconnect = Instant::now();
+            }
+            Action::Console(command) => {
+                let command = command.trim();
+                ensure!(!command.is_empty(), "Enter a command");
+                match command {
+                    "?" => {
+                        self.s.console("> ?");
+                        self.realtime(b"?")?;
+                    }
+                    "!" => {
+                        if self.s.status.state == "Run" {
+                            self.s.job = true;
+                        }
+                        self.action(Action::Pause)?;
+                    }
+                    "~" => self.action(Action::Resume)?,
+                    _ => {
+                        ensure!(
+                            self.s.connected
+                                && self.s.initialized
+                                && !self.s.job
+                                && !self.s.tracing
+                                && !self.s.transferring
+                                && (self.s.status.idle() || self.s.status.state.contains("Alarm")),
+                            "Ordinary console commands require an idle or alarmed controller; ? ! ~ remain available during jobs"
+                        );
+                        ensure!(
+                            command.is_ascii()
+                                && !command.bytes().any(|b| b < 32)
+                                && !command.contains(['?', '!', '~']),
+                            "Send one command at a time; realtime controls must be sent separately"
+                        );
+                        self.queue.push_back(QueuedCommand {
+                            text: command.into(),
+                            manual: true,
+                        });
+                    }
+                }
+            }
+            Action::TraceHull { speed } => {
+                ensure!(
+                    self.s.can_jog()
+                        && self.s.status.idle()
+                        && self.s.status.position_known
+                        && !self.s.status.torch
+                        && self.stopping.is_none()
+                        && self.pending.is_none()
+                        && self.queue.is_empty(),
+                    "Hull tracing requires an idle machine with the torch off"
+                );
+                ensure!(
+                    speed.is_finite() && (1.0..=3000.0).contains(&speed),
+                    "Invalid trace speed"
+                );
+                let original = &self
+                    .s
+                    .program
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Open a job before tracing its hull"))?
+                    .original;
+                let program = gcode::parse(original, self.s.options)?;
+                let mut hull = program.hull();
+                ensure!(hull.len() >= 2, "This job has no XY extent to trace");
+                let start = self.s.status.wpos;
+                let closest = hull
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        a.distance(Point { z: 0.0, ..start })
+                            .total_cmp(&b.distance(Point { z: 0.0, ..start }))
+                    })
+                    .unwrap()
+                    .0;
+                hull.rotate_left(closest);
+                hull.push(hull[0]);
+                hull.push(Point { z: 0.0, ..start });
+                if program.uploaded != self.s.program.as_ref().unwrap().uploaded {
+                    self.need_upload = true;
+                    self.failed_transfer = false;
+                    self.s.ready = false;
+                }
+                self.s.program = Some(Arc::new(program));
+                self.preview_dirty = true;
+                self.s.tracing = true;
+                self.s.phase = "Tracing hull…".into();
+                self.s.error = None;
+                self.s
+                    .log(format!("Tracing hull at {speed:.0} mm/min with torch off"));
+                self.trace = Some(Trace {
+                    points: hull,
+                    next: 0,
+                    sent: None,
+                    speed,
+                });
+            }
+            Action::CancelTrace => {
+                self.trace = None;
+                self.s.tracing = false;
+                self.queue.retain(|cmd| !cmd.starts_with("$J="));
+                self.realtime(&[protocol::JOG_CANCEL])?;
+                self.s.phase = "Hull trace cancelled".into();
             }
         }
         Ok(())
@@ -984,14 +1243,108 @@ impl Worker {
                 // Short commands plus a UI heartbeat bound motion if the UI stalls.
                 let length = (x * x + y * y).sqrt().max(1.0);
                 let distance = speed / 60.0 * 0.12;
-                self.queue.push_back(format!(
-                    "$J=G21G91X{:.5}Y{:.5}F{speed:.1}",
-                    x / length * distance,
-                    y / length * distance
-                ));
+                self.queue.push_back(
+                    format!(
+                        "$J=G21G91X{:.5}Y{:.5}F{speed:.1}",
+                        x / length * distance,
+                        y / length * distance
+                    )
+                    .into(),
+                );
                 self.last_jog = Instant::now();
             }
         }
+        Ok(())
+    }
+    fn reset_controller(&mut self) -> Result<()> {
+        self.realtime(&[protocol::RESET])?;
+        self.s.job = false;
+        self.s.tracing = false;
+        self.trace = None;
+        self.stopping = None;
+        self.pause = PauseState::None;
+        self.jog = None;
+        self.s.ready = false;
+        self.queue.clear();
+        self.pending = None;
+        self.s.initialized = false;
+        self.init_started = false;
+        self.selected_work_system = false;
+        self.got_units = false;
+        self.auto_reports = false;
+        self.reset_wait = Some(Instant::now());
+        self.s.phase = "Stopped".into();
+        self.need_verify = self.s.program.is_some();
+        self.s.log("Job stopped; controller reset");
+        Ok(())
+    }
+    fn advance_stop(&mut self) -> Result<()> {
+        let Some(started) = self.stopping else {
+            return Ok(());
+        };
+        if self.s.status.fresh()
+            && self.s.status.at.is_some_and(|at| at > started)
+            && (self.s.status.held() || self.s.status.idle())
+        {
+            self.reset_controller()?;
+        } else if started.elapsed() > Duration::from_secs(5) {
+            self.reset_controller()?;
+            anyhow::bail!(
+                "Motion hold timed out; issued an immediate reset. Check the controller alarm before continuing"
+            );
+        }
+        Ok(())
+    }
+    fn advance_trace(&mut self) -> Result<()> {
+        if self.trace.is_none() {
+            return Ok(());
+        }
+        if self.s.status.torch {
+            self.reset_controller()?;
+            anyhow::bail!("Hull trace stopped because the torch was reported on");
+        }
+        if self.s.status.state.contains("Alarm") {
+            self.trace = None;
+            self.s.tracing = false;
+            self.s.phase = "Hull trace stopped by alarm".into();
+            return Ok(());
+        }
+        if !self.s.connected
+            || !self.s.status.fresh()
+            || self.pending.is_some()
+            || !self.queue.is_empty()
+        {
+            return Ok(());
+        }
+        let trace = self.trace.as_mut().unwrap();
+        if let Some(sent) = trace.sent {
+            let current = Point {
+                z: 0.0,
+                ..self.s.status.wpos
+            };
+            if !self.s.status.idle()
+                || self.s.status.at.is_none_or(|at| at <= sent)
+                || current.distance(trace.points[trace.next]) > 0.01
+            {
+                return Ok(());
+            }
+            trace.next += 1;
+            trace.sent = None;
+        }
+        if trace.next == trace.points.len() {
+            self.trace = None;
+            self.s.tracing = false;
+            self.s.phase = "Hull trace complete".into();
+            self.s
+                .log("Hull trace complete; returned to starting position");
+            return Ok(());
+        }
+        let point = trace.points[trace.next];
+        self.queue.push_back(
+            format!("$J=G21G90X{:.3}Y{:.3}F{:.1}", point.x, point.y, trace.speed).into(),
+        );
+        trace.sent = Some(Instant::now());
+        self.s.phase = format!("Tracing hull · {}/{}", trace.next + 1, trace.points.len());
         Ok(())
     }
     fn advance_transfer(&mut self) {
@@ -1000,6 +1353,7 @@ impl Worker {
             && self.s.status.idle()
             && self.s.status.position_known
             && !self.s.job
+            && !self.s.tracing
             && self.pending.is_none()
             && self.queue.is_empty()
             && self.transfer.is_none()
@@ -1063,6 +1417,7 @@ impl Worker {
             && self.s.status.fresh()
             && self.s.status.idle()
             && !self.s.job
+            && !self.s.tracing
             && self.pending.is_none()
             && self.queue.is_empty()
             && self.s.status.position_known
@@ -1152,5 +1507,60 @@ mod tests {
         tracker.elapsed = 100.0;
         tracker.sample(&p, &status);
         assert_eq!(tracker.coefficient(), 1.0);
+    }
+    #[test]
+    fn stop_requires_a_report_newer_than_its_hold_request() {
+        let sim = crate::simulator::Simulator::start().unwrap();
+        let (_tx, rx) = mpsc::channel();
+        let mut worker = Worker::new(
+            sim.address.clone(),
+            sim.http.clone(),
+            rx,
+            Arc::new(Mutex::new(Snapshot::default())),
+        );
+        worker.link = Some(Link::connect(&sim.address).unwrap());
+        worker.s.connected = true;
+        worker.s.job = true;
+        worker.got_units = true;
+        worker
+            .s
+            .status
+            .update("<Hold:0|MPos:0,0,0|WCO:0,0,0|Ov:100,100,100>", false);
+        worker.action(Action::Stop).unwrap();
+        worker.advance_stop().unwrap();
+        assert!(
+            worker.reset_wait.is_none(),
+            "A stale paused report cannot justify reset after Resume"
+        );
+        worker
+            .line("<Hold:0|MPos:0,0,0|WCO:0,0,0|Ov:100,100,100>")
+            .unwrap();
+        worker.advance_stop().unwrap();
+        assert!(worker.reset_wait.is_some());
+    }
+    #[test]
+    fn tracing_does_not_mark_changed_processed_contents_as_verified() {
+        let (_tx, rx) = mpsc::channel();
+        let mut worker = Worker::new(
+            "127.0.0.1:1".into(),
+            "http://127.0.0.1:1".into(),
+            rx,
+            Arc::new(Mutex::new(Snapshot::default())),
+        );
+        worker.s.connected = true;
+        worker.s.initialized = true;
+        worker.s.ready = true;
+        worker
+            .s
+            .status
+            .update("<Idle|MPos:0,0,0|WCO:0,0,0|Ov:100,100,100>", false);
+        let original = "M3\nG1X10F60\nM5";
+        let previous = gcode::parse(original, worker.s.options).unwrap();
+        assert!(!previous.uploaded.contains("G4"));
+        worker.s.program = Some(Arc::new(previous));
+        worker.s.options.initial_speed = 1.0;
+        worker.action(Action::TraceHull { speed: 600.0 }).unwrap();
+        assert!(worker.s.program.as_ref().unwrap().uploaded.contains("G4"));
+        assert!(!worker.s.ready && worker.need_upload);
     }
 }
