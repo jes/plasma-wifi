@@ -1,0 +1,54 @@
+name: "CNC Plasma"
+board: "Arduino Nano ESP32"
+
+stepping:
+  engine: RMT
+  idle_ms: 255
+  pulse_us: 4
+  dir_delay_us: 2
+  disable_delay_us: 0
+
+axes:
+  x:
+    steps_per_mm: 80
+    max_rate_mm_per_min: 3000
+    acceleration_mm_per_sec2: 100
+    max_travel_mm: 300
+    soft_limits: false
+
+    motor0:
+      standard_stepper:
+        step_pin: gpio.17
+        direction_pin: gpio.6
+
+  y:
+    steps_per_mm: 80
+    max_rate_mm_per_min: 3000
+    acceleration_mm_per_sec2: 100
+    max_travel_mm: 400
+    soft_limits: false
+
+    motor0:
+      standard_stepper:
+        step_pin: gpio.8
+        direction_pin: gpio.10
+
+  z:
+    steps_per_mm: 80
+    max_rate_mm_per_min: 1000
+    acceleration_mm_per_sec2: 50
+    max_travel_mm: 100
+    soft_limits: false
+
+    motor0:
+      standard_stepper:
+        step_pin: gpio.7
+        direction_pin: gpio.9
+
+Relay:
+  output_pin: gpio.5
+  tool_num: 0
+  off_on_alarm: true
+
+start:
+  must_home: false
