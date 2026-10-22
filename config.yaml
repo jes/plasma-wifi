@@ -1,6 +1,8 @@
 name: "CNC Plasma"
 board: "Arduino Nano ESP32"
 
+use_line_numbers: true
+
 stepping:
   engine: RMT
   idle_ms: 255
