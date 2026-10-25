@@ -36,7 +36,7 @@ successfully uploaded and verified. If disconnected, show that the file is await
 
 It can do some preprocessing to strip out comments, unnecessary spaces, etc. to make the program as short as possible but it *must not*
 inadvertently change the behaviour of the program because nobody wants to have to debug that.
-The deliberate exceptions are insertion of the configured pierce delay after torch ignition and rounding positional words
+The deliberate exception is rounding positional words
 (X/Y/Z/I/J/K/R) to no more than three decimal places in the file’s units. Strip trailing zeroes and unnecessary leading
 zeroes on G codes: emit G0, G1, G2, etc. Preview and timing must use the same rounded coordinates as the upload.
 Accept FreeCAD’s unused K0 on XY arcs, matching FluidNC 4.1.1; this is not a drilling-cycle command.
@@ -46,10 +46,9 @@ as well as linear moves, and track modal state correctly for processing, preview
 absolute moves, but do not silently assume those modes: handle G20/G21 and G90/G91. If a construct cannot be processed or estimated
 correctly, report that limitation clearly rather than silently changing its meaning or showing a misleading preview or estimate.
 
-Pierce delay is configured in plasma-wifi, rather than authored into each CAM program. The G-code will command torch ignition
-using M3 S1 or the equivalent supported torch-on command. Preprocessing should insert a dwell for the configured pierce delay
-after each torch ignition and before subsequent cutting motion. Include these inserted dwells in the uploaded-code view, line
-mapping and time estimate. Changing the configured delay must regenerate and upload the job before it can next be run.
+Pierce delay belongs in the CAM program because it depends on material thickness. Preserve CAM-authored G4 dwells
+unchanged and include them in the uploaded-code view, line mapping and time estimate. The sender must not configure or
+insert pierce delays, or split combined torch ignition/motion blocks to add them.
 
 And then I need controls for feed override. I don't need spindle speed control at all as it is a plasma cutter.
 
@@ -95,11 +94,11 @@ scroll so that the top line is not at the top, don't mind so much for the last l
 And obviously I'll want run, pause, stop, whatever buttons.
 
 Pause must hold motion and turn off the torch, remembering whether it was lit. On Resume, if the torch was lit before the pause,
-light it again and wait the configured pierce delay before resuming motion. If it was off, resume without lighting it or adding
-a pierce delay. This must work while executing the uploaded LocalFS file; establish the FluidNC 4.1.1 mechanism for doing it
+light it again and resume motion once torch restoration is confirmed. If it was off, resume without lighting it.
+The sender adds no delay on Resume. This must work while executing the uploaded LocalFS file; establish the FluidNC 4.1.1 mechanism for doing it
 before implementing this behavior. Stop must abort the job and turn off the torch; a subsequent Run starts from the beginning.
-Pierce dwell time, including any extra dwell on Resume, must be accounted for in elapsed and remaining time; time spent paused
-is excluded. Feed override must not scale pierce dwell time.
+CAM-authored dwell time must be accounted for in elapsed and remaining time; time spent paused
+is excluded. Feed override must not scale dwell time.
 
 https://github.com/bdring/FluidNC/issues/330 this github issue may be useful, we will need to enable use_line_numbers:true in config.yaml.
 I have put my active config.yaml in this dir, you can make changes to it as required and I will install it using the WebUI. And just preprocess
@@ -113,7 +112,7 @@ Check file size after uploading, and potentially verify file contents if quick a
 
 Use the system file chooser rather than a custom in-app browser, while retaining portable static deployment. Give the
 window a taskbar/toolbar icon. Separate the application log from a FluidNC console, and allow typed commands in that
-console with command history. Console pause/resume must preserve the torch and pierce-delay behavior above.
+console with command history. Console pause/resume must preserve the torch behavior above.
 
 DRO and feed override feedback should update promptly, using regular controller reports and refreshes after changes.
 Give feed moves a more prominent preview color than rapids. Clear the current alarm message after the controller leaves

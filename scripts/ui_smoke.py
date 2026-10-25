@@ -62,7 +62,8 @@ try:
         d.close()
         return target
 
-    wait(lambda s: "G4P0.5" in s["file"], "Automatic upload did not finish")
+    uploaded = wait(lambda s: "G1X80Y10F1200" in s["file"], "Automatic upload did not finish")
+    assert "G4" not in uploaded["file"], "Upload added a dwell absent from CAM output"
     time.sleep(1.0)  # let verification and UI snapshots settle
     screenshot("idle.png")
     d=display.Display()
@@ -128,8 +129,7 @@ try:
     screenshot("paused.png")
     click(126, 223)  # Resume
     wait(lambda s: s["torch"], "Resume did not restore torch")
-    assert state()["state"] == "Hold:0", "Motion resumed before the pierce delay"
-    wait(lambda s: s["state"] == "Run", "Motion did not resume after pierce delay")
+    wait(lambda s: s["state"] == "Run", "Motion did not resume after torch restoration")
     click(207, 223)  # Stop
     wait(lambda s: s["state"] == "Idle" and not s["torch"], "Stop did not abort and extinguish")
 
@@ -190,7 +190,7 @@ try:
     time.sleep(0.6)
     start=state()
     previous=len(start["commands"])
-    click(100, 711)  # Trace hull at jog speed
+    click(100, 688)  # Trace hull at jog speed
     wait(lambda s: s["state"]=="Jog", "Hull trace did not start")
     screenshot("hull-trace.png")
     target=f"$J=G21G90X{start['x']:.3f}Y{start['y']:.3f}F600.0"
@@ -199,10 +199,10 @@ try:
                 "Hull trace did not close and return")
     assert not traced["torch"], "Hull trace lit the torch"
     time.sleep(0.3)
-    click(100, 711)
+    click(100, 688)
     wait(lambda s: s["state"]=="Jog", "Second hull trace did not start")
     time.sleep(0.15)
-    click(100, 711)  # Cancel hull trace
+    click(100, 688)  # Cancel hull trace
     wait(lambda s: s["state"]=="Idle", "Hull cancellation did not stop jogging")
     count=len(state()["commands"])
     time.sleep(0.4)

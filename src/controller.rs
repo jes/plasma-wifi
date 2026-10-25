@@ -15,36 +15,20 @@ use std::{
 
 #[derive(Clone, Debug)]
 pub enum Action {
-    Load {
-        name: String,
-        text: String,
-        pierce: f64,
-    },
+    Load { name: String, text: String },
     Run,
     Pause,
     Resume,
     Stop,
     Unlock,
     Console(String),
-    TraceHull {
-        speed: f64,
-    },
+    TraceHull { speed: f64 },
     CancelTrace,
     Feed(u8),
-    Jog {
-        x: f64,
-        y: f64,
-        speed: f64,
-    },
+    Jog { x: f64, y: f64, speed: f64 },
     CancelJog,
-    SetCoordinate {
-        axis: char,
-        value: f64,
-    },
-    Connect {
-        address: String,
-        http: String,
-    },
+    SetCoordinate { axis: char, value: f64 },
+    Connect { address: String, http: String },
 }
 
 #[derive(Clone)]
@@ -230,7 +214,6 @@ enum PauseState {
     TurningOff { was_lit: bool, sent: Instant },
     Paused { was_lit: bool },
     Restoring { sent: Instant },
-    Piercing { until: Instant },
 }
 
 #[derive(Default)]
@@ -242,7 +225,7 @@ struct Tracker {
     fraction: f64,
     last_feed: f64,
     last_rapid: f64,
-    resume_dwell: f64,
+    restore_time: f64,
     last_index: Option<usize>,
     block_fraction: f64,
 }
@@ -288,7 +271,7 @@ impl Tracker {
         if self.expected_motion < 2.0 {
             1.0
         } else {
-            ((self.elapsed - self.dwell - self.resume_dwell).max(0.0) / self.expected_motion)
+            ((self.elapsed - self.dwell - self.restore_time).max(0.0) / self.expected_motion)
                 .clamp(0.1, 10.0)
         }
     }
@@ -384,22 +367,19 @@ impl Worker {
             let now = Instant::now();
             let dt = now.duration_since(self.last_tick).as_secs_f64();
             self.last_tick = now;
-            let actively_piercing = matches!(
-                self.pause,
-                PauseState::Piercing { .. } | PauseState::Restoring { .. }
-            );
+            let restoring_torch = matches!(self.pause, PauseState::Restoring { .. });
             if self.s.job
                 && self.s.connected
                 && (self.s.phase == "Starting"
-                    || actively_piercing
+                    || restoring_torch
                     || (self.s.status.state == "Run"
                         || self.s.status.state == "Hold:1"
                         || self.s.status.state == "Idle" && self.s.status.file.is_some())
                         && !matches!(self.pause, PauseState::Paused { .. }))
             {
                 self.tracker.elapsed += dt;
-                if actively_piercing {
-                    self.tracker.resume_dwell += dt;
+                if restoring_torch {
+                    self.tracker.restore_time += dt;
                 }
             }
             loop {
@@ -472,14 +452,6 @@ impl Worker {
                     self.s.status.rapid_override,
                     self.s.coefficient,
                 );
-                if let PauseState::Piercing { until } = self.pause {
-                    self.s.remaining += until
-                        .saturating_duration_since(Instant::now())
-                        .as_secs_f64();
-                }
-                if matches!(self.pause, PauseState::Restoring { .. }) {
-                    self.s.remaining += self.s.options.pierce_seconds;
-                }
             }
             *self.shared.lock().unwrap() = self.s.clone();
             thread::sleep(Duration::from_millis(10));
@@ -524,9 +496,7 @@ impl Worker {
             PauseState::TurningOff { was_lit, .. } | PauseState::Paused { was_lit } => {
                 PauseState::Paused { was_lit }
             }
-            PauseState::Restoring { .. } | PauseState::Piercing { .. } => {
-                PauseState::Paused { was_lit: true }
-            }
+            PauseState::Restoring { .. } => PauseState::Paused { was_lit: true },
             other => other,
         };
         self.reconcile_pause = !matches!(self.pause, PauseState::None);
@@ -855,7 +825,7 @@ impl Worker {
     }
     fn action(&mut self, action: Action) -> Result<()> {
         match action {
-            Action::Load { name, text, pierce } => {
+            Action::Load { name, text } => {
                 ensure!(
                     !self.s.job && !self.s.tracing && self.transfer.is_none(),
                     "Cannot replace a running, paused or uploading job"
@@ -864,12 +834,7 @@ impl Worker {
                     !self.s.connected || !self.s.initialized || self.s.status.idle(),
                     "Wait until the controller is idle before opening a file"
                 );
-                let opts = ParseOptions {
-                    pierce_seconds: pierce,
-                    ..self.s.options
-                };
-                let p = gcode::parse(&text, opts)?;
-                self.s.options.pierce_seconds = pierce;
+                let p = gcode::parse(&text, self.s.options)?;
                 self.s.name = name;
                 self.s.program = Some(Arc::new(p));
                 self.s.ready = false;
@@ -1206,22 +1171,15 @@ impl Worker {
             }
             PauseState::Restoring { sent } => {
                 if self.s.status.torch && self.s.status.accessory_at.is_some_and(|t| t > sent) {
-                    self.pause = PauseState::Piercing {
-                        until: Instant::now()
-                            + Duration::from_secs_f64(self.s.options.pierce_seconds),
-                    };
-                    self.s.phase = "Piercing before resume…".into();
+                    self.realtime(&[protocol::RESUME])?;
+                    self.pause = PauseState::None;
+                    self.s.phase = "Running".into();
                 } else if sent.elapsed() > Duration::from_secs(5) {
                     self.realtime(&[protocol::RESET])?;
                     self.s.job = false;
                     self.pause = PauseState::None;
                     anyhow::bail!("Torch restore confirmation timed out; job aborted");
                 }
-            }
-            PauseState::Piercing { until } if Instant::now() >= until => {
-                self.realtime(&[protocol::RESUME])?;
-                self.pause = PauseState::None;
-                self.s.phase = "Running".into();
             }
             _ => {}
         }
@@ -1539,7 +1497,7 @@ mod tests {
         assert!(worker.reset_wait.is_some());
     }
     #[test]
-    fn tracing_does_not_mark_changed_processed_contents_as_verified() {
+    fn tracing_preserves_cam_contents_when_initial_torch_speed_changes() {
         let (_tx, rx) = mpsc::channel();
         let mut worker = Worker::new(
             "127.0.0.1:1".into(),
@@ -1557,10 +1515,11 @@ mod tests {
         let original = "M3\nG1X10F60\nM5";
         let previous = gcode::parse(original, worker.s.options).unwrap();
         assert!(!previous.uploaded.contains("G4"));
+        let uploaded = previous.uploaded.clone();
         worker.s.program = Some(Arc::new(previous));
         worker.s.options.initial_speed = 1.0;
         worker.action(Action::TraceHull { speed: 600.0 }).unwrap();
-        assert!(worker.s.program.as_ref().unwrap().uploaded.contains("G4"));
-        assert!(!worker.s.ready && worker.need_upload);
+        assert_eq!(worker.s.program.as_ref().unwrap().uploaded, uploaded);
+        assert!(worker.s.ready && !worker.need_upload);
     }
 }

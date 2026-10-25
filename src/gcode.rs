@@ -59,7 +59,6 @@ pub struct Block {
     pub n: usize,
     pub source: usize,
     pub code: String,
-    pub inserted: bool,
     pub path: Vec<Point>,
     pub rapid: bool,
     pub torch: bool,
@@ -161,7 +160,6 @@ impl Program {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ParseOptions {
-    pub pierce_seconds: f64,
     pub start: Point,
     pub wco: Point,
     pub rapid: Point,
@@ -177,7 +175,6 @@ pub struct ParseOptions {
 impl Default for ParseOptions {
     fn default() -> Self {
         Self {
-            pierce_seconds: 0.5,
             start: Point::default(),
             wco: Point::default(),
             rapid: Point {
@@ -303,10 +300,6 @@ struct Parser {
 }
 
 pub fn parse(original: &str, opts: ParseOptions) -> Result<Program> {
-    ensure!(
-        opts.pierce_seconds.is_finite() && (0.0..=60.0).contains(&opts.pierce_seconds),
-        "Pierce delay must be between 0 and 60 seconds"
-    );
     let mut p = Parser {
         opts,
         position: opts.start,
@@ -347,7 +340,7 @@ pub fn parse(original: &str, opts: ParseOptions) -> Result<Program> {
                 source + 1
             ));
         }
-        p.line(w, source)
+        p.process(&w, source)
             .with_context(|| format!("Line {}", source + 1))?;
     }
     ensure!(
@@ -365,12 +358,7 @@ pub fn parse(original: &str, opts: ParseOptions) -> Result<Program> {
             .map(|s| s.chars().count() + 8)
             .max()
             .unwrap_or(0),
-        max_uploaded_columns: p
-            .blocks
-            .iter()
-            .map(|b| b.code.len() + if b.inserted { 30 } else { 8 })
-            .max()
-            .unwrap_or(0),
+        max_uploaded_columns: p.blocks.iter().map(|b| b.code.len() + 8).max().unwrap_or(0),
         original: original.to_owned(),
         source_lines,
         uploaded,
@@ -381,57 +369,8 @@ pub fn parse(original: &str, opts: ParseOptions) -> Result<Program> {
 }
 
 impl Parser {
-    fn line(&mut self, w: Vec<Word>, source: usize) -> Result<()> {
-        // Move ignition into a separate block if a CAM post combines M3/S with motion.
-        // Reject tool-changing combined ignition: its ordering needs a configured ATC.
-        validate_modal_groups(&w)?;
-        let m3 = w.iter().any(|w| w.letter == 'M' && w.value == 3.0);
-        let m5 = w.iter().any(|w| w.letter == 'M' && w.value == 5.0);
-        let next_speed = w
-            .iter()
-            .find(|w| w.letter == 'S')
-            .map_or(self.speed, |w| w.value);
-        let next_spindle = !m5 && (m3 || self.spindle);
-        let ignition = next_spindle && next_speed > 0.0 && (!self.spindle || self.speed <= 0.0);
-        let has_motion = w.iter().any(|w| {
-            matches!(w.letter, 'X' | 'Y' | 'Z' | 'I' | 'J' | 'K' | 'R')
-                || w.letter == 'G' && (0.0..=4.0).contains(&w.value)
-        });
-        if ignition && has_motion {
-            ensure!(
-                !w.iter()
-                    .any(|w| w.letter == 'T' || w.letter == 'M' && w.value != 3.0),
-                "combined torch ignition, motion and auxiliary M/T commands must be separate blocks"
-            );
-            let (on, rest): (Vec<_>, Vec<_>) = w
-                .into_iter()
-                .partition(|w| w.letter == 'S' || w.letter == 'M');
-            self.process(&on, source, false)?;
-            self.pierce(source)?;
-            self.process(&rest, source, false)?;
-        } else {
-            let was_on = self.spindle && self.speed > 0.0;
-            self.process(&w, source, false)?;
-            // S0 -> positive S can also ignite an already-enabled relay spindle.
-            if self.spindle && self.speed > 0.0 && !was_on {
-                self.pierce(source)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn pierce(&mut self, source: usize) -> Result<()> {
-        if self.opts.pierce_seconds > 0.0 {
-            let code = format!("G4P{}", self.opts.pierce_seconds);
-            self.process(&words(&code)?, source, true)?;
-        }
-        Ok(())
-    }
-
-    fn process(&mut self, w: &[Word], source: usize, inserted: bool) -> Result<()> {
-        if w.is_empty() {
-            return Ok(());
-        }
+    fn process(&mut self, w: &[Word], source: usize) -> Result<()> {
+        validate_modal_groups(w)?;
         let get = |letter| w.iter().find(|w| w.letter == letter).map(|w| w.value);
         for letter in "XYZIJKRFPST".chars() {
             ensure!(
@@ -655,7 +594,6 @@ impl Parser {
             n: self.blocks.len() + 1,
             source,
             code,
-            inserted,
             path: if self.ended { Vec::new() } else { path },
             rapid,
             torch: self.spindle && self.speed > 0.0,
@@ -735,13 +673,14 @@ mod tests {
         parse(s, ParseOptions::default()).unwrap()
     }
     #[test]
-    fn rounds_uploaded_coordinates_and_maps_inserted_lines() {
+    fn rounds_uploaded_coordinates_and_maps_source_lines() {
         let p = program("(FreeCAD)\nN10 G21 G90\n M3 S1 ; torch\nG1 X1.234567890 F60\nM5\n");
-        assert_eq!(p.blocks[2].code, "G4P0.5");
-        assert_eq!(p.blocks[2].source, 2);
-        assert!(p.uploaded.contains("N4G1X1.235F60\n"));
+        assert_eq!(p.blocks[1].code, "M3S1");
+        assert_eq!(p.blocks[1].source, 2);
+        assert_eq!(p.blocks[2].source, 3);
+        assert!(p.uploaded.contains("N3G1X1.235F60\n"));
         assert!((p.total.feed - 1.235).abs() < 1e-9);
-        assert_eq!(p.total.dwell, 0.5);
+        assert_eq!(p.total.dwell, 0.0);
     }
     #[test]
     fn arcs_units_incremental_and_helices() {
@@ -759,11 +698,24 @@ mod tests {
         assert!((a.total.feed + b.total.feed - TAU * 10.0).abs() < 1e-8);
     }
     #[test]
-    fn combined_ignition_delays_before_motion() {
+    fn combined_ignition_and_motion_stay_in_one_block() {
         let p = program("G1X10M3S1F60");
-        assert_eq!(p.blocks[0].code, "M3S1");
-        assert!(p.blocks[1].inserted);
-        assert_eq!(p.blocks[2].time.feed, 10.0);
+        assert_eq!(p.uploaded, "N1G1X10M3S1F60\n");
+        assert_eq!(p.blocks[0].time.feed, 10.0);
+        assert!(p.blocks[0].torch);
+        assert_eq!(p.total.dwell, 0.0);
+    }
+    #[test]
+    fn cam_dwells_are_preserved_and_timed_without_extra_delays() {
+        let p = program("M3S1\nG4P0.123456\nG1X10F60\nM5\nM3S1G4P1.75\nG1X20\nM5");
+        assert_eq!(
+            p.uploaded,
+            "N1M3S1\nN2G4P0.123456\nN3G1X10F60\nN4M5\nN5M3S1G4P1.75\nN6G1X20\nN7M5\n"
+        );
+        assert_eq!(p.blocks[4].source, 4);
+        assert_eq!(p.total.feed, 20.0);
+        assert_eq!(p.total.dwell, 0.123456 + 1.75);
+        assert!((p.total.seconds(2.0, 1.0, 1.0) - (10.0 + 0.123456 + 1.75)).abs() < 1e-9);
     }
     #[test]
     fn rejects_ambiguous_input_instead_of_rewriting() {
@@ -803,16 +755,17 @@ mod tests {
         assert!(parse("(comment)\n%\nG1X999F60", ParseOptions::default()).is_err());
     }
     #[test]
-    fn speed_only_ignition_and_zero_speed_are_handled_before_motion() {
+    fn speed_only_ignition_and_zero_speed_preserve_blocks() {
         let p = program("M3S0\nS1G1X10F60");
-        assert_eq!(p.blocks[1].code, "S1");
-        assert!(p.blocks[2].inserted);
-        assert_eq!(p.total.dwell, 0.5);
+        assert_eq!(p.uploaded, "N1M3S0\nN2S1G1X10F60\n");
+        assert!(p.blocks[1].torch);
+        assert_eq!(p.total.dwell, 0.0);
         let p = program("G1X10F60M3S0");
+        assert!(!p.blocks[0].torch);
         assert_eq!(p.total.dwell, 0.0);
     }
     #[test]
-    fn modal_duplicates_are_rejected_before_splitting() {
+    fn modal_duplicates_are_rejected() {
         assert!(parse("G0G1X10M3S1F60", ParseOptions::default()).is_err());
         assert!(parse("M3M5S1G1X10F60", ParseOptions::default()).is_err());
     }

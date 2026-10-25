@@ -174,7 +174,6 @@ impl Machine {
             match gcode::parse(
                 &self.file,
                 ParseOptions {
-                    pierce_seconds: 0.0,
                     start: self.position,
                     wco: self.wco,
                     ..Default::default()
@@ -523,11 +522,13 @@ mod tests {
         wait(&controller, |s| s.initialized);
         controller.send(Action::Load {
             name: "test.nc".into(),
-            text: "G21G90\nM3S1\nG1X100F600\nM5\nM30".into(),
-            pierce: 0.15,
+            text: "G21G90\nM3S1\nG4P0.123456\nG1X100F600\nM5\nM30".into(),
         });
         let ready = wait(&controller, |s| s.ready);
-        assert!(protocol::verify(&sim.http, &ready.program.unwrap().uploaded).is_ok());
+        let program = ready.program.unwrap();
+        assert_eq!(program.total.dwell, 0.123456);
+        assert_eq!(program.uploaded.matches("G4").count(), 1);
+        assert!(protocol::verify(&sim.http, &program.uploaded).is_ok());
         controller.send(Action::Run);
         wait(&controller, |s| s.status.state == "Run" && s.status.torch);
         controller.send(Action::Pause);
@@ -537,9 +538,8 @@ mod tests {
         thread::sleep(Duration::from_millis(250));
         assert!((controller.snapshot().elapsed - elapsed).abs() < 0.05);
         controller.send(Action::Resume);
-        wait(&controller, |s| s.phase == "Piercing before resume…");
-        assert!(controller.snapshot().status.held());
-        wait(&controller, |s| s.status.state == "Run");
+        let resumed = wait(&controller, |s| s.status.state == "Run");
+        assert!(resumed.status.torch);
         sim.disconnect();
         wait(&controller, |s| !s.connected);
         let resumed = wait(&controller, |s| s.initialized);
@@ -587,7 +587,6 @@ mod tests {
         controller.send(Action::Load {
             name: "pause.nc".into(),
             text: "G21G90\nM3S1\nG1X100F600\nM5\nM30".into(),
-            pierce: 0.15,
         });
         wait(&controller, |s| s.can_run());
         controller.send(Action::Run);
@@ -601,9 +600,8 @@ mod tests {
         });
         assert!(!s.status.torch);
         controller.send(Action::Resume);
-        wait(&controller, |s| s.phase == "Piercing before resume…");
-        assert!(controller.snapshot().status.torch);
-        assert!(controller.snapshot().status.held());
+        let resumed = wait(&controller, |s| s.status.state == "Run");
+        assert!(resumed.status.torch);
         controller.send(Action::Stop);
         wait(&controller, |s| s.initialized && !s.job && !s.status.torch);
     }
@@ -615,7 +613,6 @@ mod tests {
         controller.send(Action::Load {
             name: "short.nc".into(),
             text: "G21G90\nM3S1\nG1X20F600\nM5\nM30".into(),
-            pierce: 0.0,
         });
         wait(&controller, |s| s.can_run());
         controller.send(Action::Run);
@@ -649,7 +646,6 @@ mod tests {
         controller.send(Action::Load {
             name: "tiny.nc".into(),
             text: "G21G90\nG0X0\nM30".into(),
-            pierce: 0.0,
         });
         wait(&controller, |s| s.can_run());
         controller.send(Action::Run);
@@ -679,7 +675,6 @@ mod tests {
         controller.send(Action::Load {
             name: "hull.nc".into(),
             text: "G21G90\nG0X10Y0\nM3S1\nG1X10Y10F600\nX5Y5\nX0Y10\nM5\nM30".into(),
-            pierce: 0.1,
         });
         wait(&controller, |s| s.can_run());
         let start = controller.snapshot().status.wpos;
@@ -742,7 +737,6 @@ mod tests {
         controller.send(Action::Load {
             name: "stop.nc".into(),
             text: "G21G90\nM3S1\nG1X100F600\nM5\nM30".into(),
-            pierce: 0.0,
         });
         wait(&controller, |s| s.can_run());
         controller.send(Action::Run);
@@ -784,7 +778,6 @@ mod tests {
         controller.send(Action::Load {
             name: "trace.nc".into(),
             text: "G21G90\nG0X10\nG1Y10F600\nX0\nY0\nM30".into(),
-            pierce: 0.0,
         });
         wait(&controller, |s| s.can_run());
         sim.machine.lock().unwrap().torch = true;

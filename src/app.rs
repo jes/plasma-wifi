@@ -22,7 +22,6 @@ const RED: Color32 = Color32::from_rgb(255, 105, 105);
 pub struct Settings {
     pub address: String,
     pub http: String,
-    pub pierce: f64,
     pub jog_speed: f64,
     pub last_dir: PathBuf,
 }
@@ -31,7 +30,6 @@ impl Default for Settings {
         Self {
             address: "192.168.0.1:23".into(),
             http: "http://192.168.0.1".into(),
-            pierce: 0.5,
             jog_speed: 600.0,
             last_dir: std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -96,14 +94,12 @@ pub struct App {
     zoom: f32,
     pan: Vec2,
     demo: bool,
-    applied_pierce: f64,
 }
 impl App {
     pub fn new(settings: Settings, demo: bool) -> Self {
         Self {
             controller: Controller::start(settings.address.clone(), settings.http.clone()),
             snapshot: Snapshot::default(),
-            applied_pierce: settings.pierce,
             settings,
             dro: ["0.000".into(), "0.000".into()],
             dro_edit: [false; 2],
@@ -147,7 +143,6 @@ impl App {
                         .to_string_lossy()
                         .into(),
                     text,
-                    pierce: self.settings.pierce,
                 });
                 self.zoom = 1.0;
                 self.pan = Vec2::ZERO;
@@ -160,7 +155,6 @@ impl App {
         self.controller.send(Action::Load {
             name: name.into(),
             text: text.into(),
-            pierce: self.settings.pierce,
         });
     }
     pub fn ui(&mut self, root: &mut egui::Ui) {
@@ -531,10 +525,6 @@ impl App {
             }
         ));
         ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("Pierce delay");
-            ui.label(format!("{:.3} s", self.applied_pierce));
-        });
         if self.snapshot.tracing {
             if ui.button("Cancel hull trace").clicked() {
                 self.controller.send(Action::CancelTrace);
@@ -824,12 +814,7 @@ impl App {
                     format!("{:>5}  {}", row + 1, program.source_lines[row])
                 } else {
                     let b = &program.blocks[row];
-                    format!(
-                        "N{:<5} {}{}",
-                        b.n,
-                        b.code,
-                        if b.inserted { "   ; pierce delay" } else { "" }
-                    )
+                    format!("N{:<5} {}", b.n, b.code)
                 };
                 let (rect, _) = ui.allocate_exact_size(
                     Vec2::new(ui.available_width().max(code_width), height),
@@ -871,16 +856,28 @@ impl App {
         if self.settings_open {
             let mut open = true;
             let mut apply = false;
-            egui::Window::new("Settings").open(&mut open).default_width(430.0).show(&ctx,|ui|{
-                ui.add_enabled_ui(!self.demo,|ui|{
-                    ui.label("Controller TCP address");ui.text_edit_singleline(&mut self.settings.address);
-                    ui.label("Controller HTTP URL (file upload)");ui.text_edit_singleline(&mut self.settings.http);
+            egui::Window::new("Settings")
+                .open(&mut open)
+                .default_width(430.0)
+                .show(&ctx, |ui| {
+                    ui.add_enabled_ui(!self.demo, |ui| {
+                        ui.label("Controller TCP address");
+                        ui.text_edit_singleline(&mut self.settings.address);
+                        ui.label("Controller HTTP URL (file upload)");
+                        ui.text_edit_singleline(&mut self.settings.http);
+                    });
+                    if ui
+                        .add_enabled(
+                            !self.snapshot.job
+                                && !self.snapshot.tracing
+                                && !self.snapshot.transferring,
+                            egui::Button::new("Apply settings"),
+                        )
+                        .clicked()
+                    {
+                        apply = true;
+                    }
                 });
-                ui.horizontal(|ui|{ui.label("Pierce delay");ui.add(egui::DragValue::new(&mut self.settings.pierce).range(0.0..=60.0).speed(0.05).suffix(" s"));});
-                ui.small("Applied to every ignition and torch restoration on Resume.");
-                if ui.add_enabled(!self.snapshot.job && !self.snapshot.tracing && !self.snapshot.transferring,egui::Button::new("Apply settings")).clicked(){apply=true;}
-                ui.small("Changing pierce delay automatically regenerates and uploads the loaded job.");
-            });
             self.settings_open = open;
             if apply {
                 if self.settings.address.trim().is_empty()
@@ -892,16 +889,6 @@ impl App {
                         address: self.settings.address.clone(),
                         http: self.settings.http.clone(),
                     });
-                    if (self.applied_pierce - self.settings.pierce).abs() > 1e-9
-                        && let Some(p) = &self.snapshot.program
-                    {
-                        self.controller.send(Action::Load {
-                            name: self.snapshot.name.clone(),
-                            text: p.original.clone(),
-                            pierce: self.settings.pierce,
-                        });
-                    }
-                    self.applied_pierce = self.settings.pierce;
                     if !self.demo {
                         self.settings.save();
                     }
