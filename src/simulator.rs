@@ -30,6 +30,10 @@ struct Machine {
     complete: bool,
     jog_until: Option<Instant>,
     inches: bool,
+    modal_inches: bool,
+    reboot_banner: bool,
+    reject_offsets: bool,
+    ignore_offsets: bool,
     disconnect_generation: u64,
     pub commands: Vec<String>,
     report_count: u64,
@@ -162,7 +166,10 @@ impl Machine {
             return "[VER:4.1:FluidNC v4.1.1 (simulator)]\nok\n".into();
         }
         if command == "$G" {
-            return "[GC:G0 G54 G17 G21 G90 G94 M5 M9 T0 F0 S0]\nok\n".into();
+            return format!(
+                "[GC:G0 G54 G17 {} G90 G94 M5 M9 T0 F0 S0]\nok\n",
+                if self.modal_inches { "G20" } else { "G21" }
+            );
         }
         if command == "$use_line_numbers" {
             return "$/use_line_numbers=true\nok\n".into();
@@ -212,14 +219,34 @@ impl Machine {
             }
             self.jog_until = Some(Instant::now() + Duration::from_millis(140));
         }
+        if command == "G21" || command == "G21G54" {
+            self.modal_inches = false;
+        }
+        if command == "G20" {
+            self.modal_inches = true;
+        }
         if command.starts_with("G10L20P1") {
+            if self.reject_offsets {
+                return "error:20\n".into();
+            }
+            if self.ignore_offsets {
+                return "ok\n".into();
+            }
+            let scale = if self.modal_inches { 25.4 } else { 1.0 };
             if let Some(value) = word(command, 'X') {
+                let value = value * scale;
                 self.wco.x += self.position.x - value;
                 self.position.x = value;
             }
             if let Some(value) = word(command, 'Y') {
+                let value = value * scale;
                 self.wco.y += self.position.y - value;
                 self.position.y = value;
+            }
+            if let Some(value) = word(command, 'Z') {
+                let value = value * scale;
+                self.wco.z += self.position.z - value;
+                self.position.z = value;
             }
         }
         "ok\n".into()
@@ -297,6 +324,27 @@ impl Simulator {
     pub fn commands(&self) -> Vec<String> {
         self.machine.lock().unwrap().commands.clone()
     }
+    #[cfg(test)]
+    fn reboot(&self, close_connection: bool) {
+        let mut m = self.machine.lock().unwrap();
+        // Firmware keeps G54 in NVS but resets its step counters on power-up.
+        m.position = Point {
+            x: -m.wco.x,
+            y: -m.wco.y,
+            z: -m.wco.z,
+        };
+        m.modal_inches = false;
+        m.program = None;
+        m.torch = false;
+        m.held = false;
+        m.jog_until = None;
+        m.report_count = 0;
+        if close_connection {
+            m.disconnect_generation += 1;
+        } else {
+            m.reboot_banner = true;
+        }
+    }
 }
 fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_millis(20)))?;
@@ -316,6 +364,11 @@ fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()
             let mut m = state.lock().unwrap();
             if m.disconnect_generation != generation {
                 return Ok(());
+            }
+            if m.reboot_banner {
+                m.reboot_banner = false;
+                interval = None;
+                stream.write_all(b"Grbl 4.1 [FluidNC v4.1.1 simulator]\n")?;
             }
             if interval.is_some_and(|interval| last_report.elapsed() >= interval) {
                 stream.write_all(m.status(interval.is_some()).as_bytes())?;
@@ -515,10 +568,259 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
     }
+    struct CheckpointFile(std::path::PathBuf);
+    impl CheckpointFile {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "plasma-wifi-{}-{id}/coordinates.json",
+                std::process::id()
+            )))
+        }
+        fn start(&self, sim: &Simulator) -> Controller {
+            Controller::start(sim.address.clone(), sim.http.clone(), Some(self.0.clone()))
+        }
+        fn saved(&self, sim: &Simulator) -> Option<Point> {
+            crate::coordinates::Coordinates::load(self.0.clone())
+                .ok()?
+                .get(&sim.address)
+        }
+    }
+    impl Drop for CheckpointFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+    fn seed_position(sim: &Simulator) -> Point {
+        let mut m = sim.machine.lock().unwrap();
+        m.position = Point {
+            x: 81.25,
+            y: -32.5,
+            z: 7.125,
+        };
+        m.wco = Point {
+            x: 10.0,
+            y: 20.0,
+            z: 3.0,
+        };
+        m.position
+    }
+    fn restored(controller: &Controller, target: Point) -> Snapshot {
+        wait(controller, |s| {
+            s.initialized && s.status.position_known && s.status.wpos.distance(target) < 0.004
+        })
+    }
+    #[test]
+    fn coordinates_survive_every_app_and_firmware_restart_combination() {
+        for (restart_app, reboot) in [(true, false), (true, true), (false, true), (false, false)] {
+            let sim = Simulator::start().unwrap();
+            let checkpoint = CheckpointFile::new();
+            let target = seed_position(&sim);
+            let controller = checkpoint.start(&sim);
+            restored(&controller, target);
+            // Simulate an origin edit followed by a jog: the saved current work
+            // position must track both, rather than just remembering the origin.
+            controller.send(Action::SetCoordinate {
+                axis: 'X',
+                value: 12.0,
+            });
+            wait(&controller, |s| {
+                s.status.position_known && (s.status.wpos.x - 12.0).abs() < 0.001
+            });
+            controller.send(Action::Jog {
+                x: 1.0,
+                y: 0.0,
+                speed: 600.0,
+            });
+            wait(&controller, |s| s.status.state == "Jog");
+            controller.send(Action::CancelJog);
+            let target = wait(&controller, |s| s.status.idle()).status.wpos;
+            // Snapshot publication follows the durable checkpoint write.
+            assert!(checkpoint.saved(&sim).unwrap().distance(target) < 1e-9);
+            let baseline = sim.commands().len();
+            let controller = if restart_app {
+                drop(controller);
+                if reboot {
+                    sim.reboot(true);
+                }
+                checkpoint.start(&sim)
+            } else {
+                if reboot {
+                    sim.reboot(true);
+                } else {
+                    sim.disconnect();
+                }
+                wait(&controller, |s| !s.connected);
+                controller
+            };
+            let expected_machine = {
+                let m = sim.machine.lock().unwrap();
+                Point {
+                    x: m.position.x + m.wco.x,
+                    y: m.position.y + m.wco.y,
+                    z: m.position.z + m.wco.z,
+                }
+            };
+            let s = restored(&controller, target);
+            assert!(
+                s.status.mpos.distance(expected_machine) < 0.004,
+                "Restoring must not move the machine"
+            );
+            assert!(s.error.is_none(), "{:?}", s.error);
+            let commands = sim.commands();
+            let writes = commands[baseline..]
+                .iter()
+                .filter(|c| c.starts_with("G10"))
+                .count();
+            assert_eq!(writes, usize::from(reboot));
+            assert!(!commands[baseline..].iter().any(|c| c.starts_with("$J=")
+                || c.starts_with("$LocalFS/Run=")
+                || c.starts_with("G0")
+                || c.starts_with("G1") && !c.starts_with("G10")));
+            // Repeat the reboot after a restoration to catch checkpoint drift.
+            sim.reboot(true);
+            wait(&controller, |s| !s.connected);
+            restored(&controller, target);
+        }
+    }
+    #[test]
+    fn reboot_banner_on_existing_link_discards_cached_coordinates() {
+        let sim = Simulator::start().unwrap();
+        let checkpoint = CheckpointFile::new();
+        let target = seed_position(&sim);
+        let controller = checkpoint.start(&sim);
+        restored(&controller, target);
+        let count = sim.commands().len();
+        sim.reboot(false);
+        wait(&controller, |s| {
+            sim.commands()[count..].iter().any(|c| c.starts_with("G10")) && s.initialized
+        });
+        let s = restored(&controller, target);
+        assert!(s.status.mpos.distance(Point::default()) < 0.001);
+        assert!(checkpoint.saved(&sim).unwrap().distance(target) < 1e-9);
+    }
+    #[test]
+    fn inch_reports_and_modal_units_survive_coordinate_restoration() {
+        let sim = Simulator::start().unwrap();
+        let checkpoint = CheckpointFile::new();
+        let target = seed_position(&sim);
+        let controller = checkpoint.start(&sim);
+        restored(&controller, target);
+        drop(controller);
+        sim.reboot(true);
+        {
+            let mut m = sim.machine.lock().unwrap();
+            m.inches = true;
+            m.modal_inches = true;
+        }
+        let controller = checkpoint.start(&sim);
+        let s = restored(&controller, target);
+        assert!(!s.options.initial_mm);
+        assert!(sim.machine.lock().unwrap().modal_inches);
+        assert!(s.status.mpos.distance(Point::default()) < 0.004);
+    }
+    #[test]
+    fn alarm_waits_for_explicit_unlock_before_restoration() {
+        let sim = Simulator::start().unwrap();
+        let checkpoint = CheckpointFile::new();
+        let target = seed_position(&sim);
+        let controller = checkpoint.start(&sim);
+        restored(&controller, target);
+        drop(controller);
+        sim.reboot(true);
+        sim.machine.lock().unwrap().alarm = Some(3);
+        let baseline = sim.commands().len();
+        let controller = checkpoint.start(&sim);
+        wait(&controller, |s| {
+            s.status.state == "Alarm" && s.version.contains("FluidNC")
+        });
+        assert!(!controller.snapshot().initialized);
+        assert!(
+            !sim.commands()[baseline..]
+                .iter()
+                .any(|c| c == "$X" || c.starts_with("G10"))
+        );
+        assert!(checkpoint.saved(&sim).unwrap().distance(target) < 1e-9);
+        controller.send(Action::Unlock);
+        restored(&controller, target);
+    }
+    #[test]
+    fn rejected_or_unverified_restoration_preserves_checkpoint_and_blocks_motion() {
+        for rejected in [true, false] {
+            let sim = Simulator::start().unwrap();
+            let checkpoint = CheckpointFile::new();
+            let target = seed_position(&sim);
+            let controller = checkpoint.start(&sim);
+            restored(&controller, target);
+            drop(controller);
+            sim.reboot(true);
+            {
+                let mut m = sim.machine.lock().unwrap();
+                m.reject_offsets = rejected;
+                m.ignore_offsets = !rejected;
+            }
+            let controller = checkpoint.start(&sim);
+            let s = wait(&controller, |s| s.error.is_some());
+            assert!(!s.initialized && !s.can_jog() && !s.can_run());
+            assert!(checkpoint.saved(&sim).unwrap().distance(target) < 1e-9);
+            assert!(s.status.mpos.distance(Point::default()) < 0.001);
+        }
+    }
+    #[test]
+    fn app_restart_during_running_job_keeps_live_coordinates() {
+        let sim = Simulator::start().unwrap();
+        let checkpoint = CheckpointFile::new();
+        let controller = checkpoint.start(&sim);
+        wait(&controller, |s| s.initialized && s.status.position_known);
+        controller.send(Action::Load {
+            name: "restart.nc".into(),
+            text: "G21G90\nM3S1\nG1X100F60\nM5\nM30".into(),
+        });
+        wait(&controller, |s| s.can_run());
+        controller.send(Action::Run);
+        wait(&controller, |s| s.status.state == "Run");
+        drop(controller);
+        let baseline = sim.commands().len();
+        let controller = checkpoint.start(&sim);
+        let s = wait(&controller, |s| s.initialized && s.status.state == "Run");
+        assert!(!s.can_jog() && !s.can_run());
+        assert!(
+            !sim.commands()[baseline..]
+                .iter()
+                .any(|c| c.starts_with("G10") || c.starts_with("$LocalFS/Run="))
+        );
+    }
+    #[test]
+    fn changing_controller_does_not_restore_another_machines_position() {
+        let sim = Simulator::start().unwrap();
+        let other = Simulator::start().unwrap();
+        let checkpoint = CheckpointFile::new();
+        let target = seed_position(&sim);
+        let controller = checkpoint.start(&sim);
+        restored(&controller, target);
+        controller.send(Action::Connect {
+            address: other.address.clone(),
+            http: other.http.clone(),
+        });
+        wait(&controller, |s| {
+            s.connected
+                && s.initialized
+                && s.status.position_known
+                && s.status.wpos == Point::default()
+        });
+        assert!(!other.commands().iter().any(|c| c.starts_with("G10")));
+        assert!(checkpoint.saved(&sim).unwrap().distance(target) < 1e-9);
+        controller.send(Action::Connect {
+            address: sim.address.clone(),
+            http: sim.http.clone(),
+        });
+        restored(&controller, target);
+    }
     #[test]
     fn full_upload_run_pause_restore_stop_and_reconnect() {
         let sim = Simulator::start().unwrap();
-        let controller = Controller::start(sim.address.clone(), sim.http.clone());
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized);
         controller.send(Action::Load {
             name: "test.nc".into(),
@@ -559,7 +861,7 @@ mod tests {
     #[test]
     fn jog_cancel_and_dro_do_not_move_machine_coordinates() {
         let sim = Simulator::start().unwrap();
-        let controller = Controller::start(sim.address.clone(), sim.http.clone());
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Jog {
             x: 1.0,
@@ -582,7 +884,7 @@ mod tests {
     #[test]
     fn reconnect_while_paused_retains_torch_restore_intent() {
         let sim = Simulator::start().unwrap();
-        let controller = Controller::start(sim.address.clone(), sim.http.clone());
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Load {
             name: "pause.nc".into(),
@@ -608,7 +910,7 @@ mod tests {
     #[test]
     fn completion_after_reconnect_does_not_wait_for_the_lost_run_ack() {
         let sim = Simulator::start().unwrap();
-        let controller = Controller::start(sim.address.clone(), sim.http.clone());
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Load {
             name: "short.nc".into(),
@@ -641,7 +943,7 @@ mod tests {
     #[test]
     fn completion_ack_handles_jobs_shorter_than_status_poll_interval() {
         let sim = Simulator::start().unwrap();
-        let controller = Controller::start(sim.address.clone(), sim.http.clone());
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Load {
             name: "tiny.nc".into(),
@@ -656,7 +958,7 @@ mod tests {
     #[test]
     fn hull_trace_is_closed_xy_only_torch_off_and_returns_to_start() {
         let sim = Simulator::start().unwrap();
-        let controller = Controller::start(sim.address.clone(), sim.http.clone());
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::SetCoordinate {
             axis: 'X',
@@ -708,7 +1010,7 @@ mod tests {
     #[test]
     fn console_is_separate_and_updates_dro_and_override_promptly() {
         let sim = Simulator::start().unwrap();
-        let controller = Controller::start(sim.address.clone(), sim.http.clone());
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         let started = Instant::now();
         controller.send(Action::Console("G10L20P1X42".into()));
@@ -732,7 +1034,7 @@ mod tests {
     #[test]
     fn normal_stop_avoids_abort_alarm_and_unlock_clears_alarm_message() {
         let sim = Simulator::start().unwrap();
-        let controller = Controller::start(sim.address.clone(), sim.http.clone());
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Load {
             name: "stop.nc".into(),
@@ -765,7 +1067,7 @@ mod tests {
             s.alarm.as_deref() == Some("ALARM:3") && !s.status.torch
         });
         assert!(!alarm.status.torch);
-        wait(&controller, |s| s.initialized && s.status.state == "Alarm");
+        wait(&controller, |s| s.status.state == "Alarm");
         controller.send(Action::Unlock);
         let unlocked = wait(&controller, |s| s.status.idle());
         assert!(unlocked.alarm.is_none());
@@ -773,7 +1075,7 @@ mod tests {
     #[test]
     fn hull_trace_rejects_lit_torch_and_never_restarts_after_reconnect() {
         let sim = Simulator::start().unwrap();
-        let controller = Controller::start(sim.address.clone(), sim.http.clone());
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Load {
             name: "trace.nc".into(),

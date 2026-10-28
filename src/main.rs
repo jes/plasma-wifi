@@ -1,5 +1,6 @@
 mod app;
 mod controller;
+mod coordinates;
 mod desktop;
 mod file_dialog;
 mod gcode;

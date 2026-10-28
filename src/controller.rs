@@ -1,10 +1,12 @@
 use crate::{
+    coordinates::Coordinates,
     gcode::{self, ParseOptions, Point, Program, TimeParts},
     protocol::{self, Link, Status},
 };
 use anyhow::{Result, ensure};
 use std::{
     collections::VecDeque,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, Sender},
@@ -175,11 +177,20 @@ pub struct Controller {
     handle: Option<thread::JoinHandle<()>>,
 }
 impl Controller {
-    pub fn start(address: String, http: String) -> Self {
+    pub fn start(address: String, http: String, coordinates_path: Option<PathBuf>) -> Self {
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Mutex::new(Snapshot::default()));
         let state = shared.clone();
-        let handle = thread::spawn(move || Worker::new(address, http, rx, state).run());
+        let handle = thread::spawn(move || {
+            let mut worker = Worker::new(address, http, rx, state);
+            if let Some(path) = coordinates_path {
+                match Coordinates::load(path) {
+                    Ok(coordinates) => worker.coordinates = coordinates,
+                    Err(e) => worker.fail(format!("Cannot load saved coordinates: {e:#}")),
+                }
+            }
+            worker.run();
+        });
         Self {
             tx: Some(tx),
             shared,
@@ -281,6 +292,14 @@ enum Transfer {
     Message(String),
     Done(Result<protocol::FileInfo>),
 }
+#[derive(Clone, Copy, Debug)]
+enum CoordinateRecovery {
+    Pending,
+    Writing,
+    Verifying(Instant),
+    Ready,
+    Failed,
+}
 struct Worker {
     address: String,
     http: String,
@@ -314,6 +333,9 @@ struct Worker {
     stopping: Option<Instant>,
     trace: Option<Trace>,
     cancel_trace_on_connect: bool,
+    coordinates: Coordinates,
+    coordinate_recovery: CoordinateRecovery,
+    checkpoint_error: bool,
 }
 impl Worker {
     fn new(
@@ -360,6 +382,9 @@ impl Worker {
             stopping: None,
             trace: None,
             cancel_trace_on_connect: false,
+            coordinates: Coordinates::default(),
+            coordinate_recovery: CoordinateRecovery::Pending,
+            checkpoint_error: false,
         }
     }
     fn run(mut self) {
@@ -392,6 +417,10 @@ impl Worker {
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         let _ = self.realtime(&[protocol::JOG_CANCEL]);
+                        self.checkpoint_coordinates();
+                        if let Err(e) = self.coordinates.flush() {
+                            eprintln!("Cannot save coordinates: {e:#}");
+                        }
                         return;
                     }
                 }
@@ -412,6 +441,7 @@ impl Worker {
                         self.got_units = false;
                         self.init_started = false;
                         self.selected_work_system = false;
+                        self.coordinate_recovery = CoordinateRecovery::Pending;
                         self.queue.clear();
                         self.pending = None;
                         self.queue.push_back("$report_inches".into());
@@ -442,6 +472,7 @@ impl Worker {
                 self.fail(format!("{e:#}"));
             }
             self.advance_transfer();
+            self.checkpoint_coordinates();
             self.s.elapsed = self.tracker.elapsed;
             if !self.s.timing_uncertain {
                 self.s.coefficient = self.tracker.coefficient();
@@ -491,7 +522,8 @@ impl Worker {
             self.s.timing_uncertain = true;
             self.reconcile_job = true;
         }
-        // Never replay a torch toggle, cycle-start, jog or coordinate write after reconnect.
+        // Never replay a torch toggle, cycle-start, jog or queued manual coordinate edit.
+        // Coordinate recovery uses only the last acknowledged/reported position.
         self.pause = match self.pause {
             PauseState::TurningOff { was_lit, .. } | PauseState::Paused { was_lit } => {
                 PauseState::Paused { was_lit }
@@ -568,7 +600,7 @@ impl Worker {
                     self.queue.push_back("$G".into());
                     self.s.status.wco_known = false;
                     self.s.status.position_known = false;
-                } else {
+                } else if self.recover_coordinates()? {
                     self.s.initialized = true;
                 }
                 if !self.s.job && self.s.phase == "Reconnecting…" {
@@ -577,6 +609,111 @@ impl Worker {
             }
         }
         Ok(())
+    }
+    fn coordinate_tolerance(&self) -> f64 {
+        // Report/Inches has a coarser effective resolution after conversion to mm.
+        if self.inches { 0.004 } else { 0.001 }
+    }
+    fn recover_coordinates(&mut self) -> Result<bool> {
+        match self.coordinate_recovery {
+            CoordinateRecovery::Ready => return Ok(true),
+            CoordinateRecovery::Failed => return Ok(false),
+            CoordinateRecovery::Writing => {
+                // All writes, including modal-unit restoration, have been acknowledged.
+                // Discard reports received before their acknowledgements.
+                self.s.status.wco_known = false;
+                self.s.status.position_known = false;
+                self.coordinate_recovery = CoordinateRecovery::Verifying(Instant::now());
+                self.realtime(b"?")?;
+                return Ok(false);
+            }
+            CoordinateRecovery::Verifying(started) => {
+                if self.s.status.position_known && self.s.status.wco_known {
+                    let target = self.coordinates.get(&self.address).unwrap();
+                    if self.s.status.wpos.distance(target) <= self.coordinate_tolerance() {
+                        self.coordinate_recovery = CoordinateRecovery::Ready;
+                        self.s.phase.clear();
+                        self.s
+                            .log("Work coordinates restored; toolhead assumed unmoved");
+                        return Ok(true);
+                    }
+                }
+                if started.elapsed() > Duration::from_secs(3) {
+                    self.coordinate_recovery = CoordinateRecovery::Failed;
+                    self.fail(
+                        "Coordinate restoration could not be verified; reconnect to retry".into(),
+                    );
+                }
+                return Ok(false);
+            }
+            CoordinateRecovery::Pending => {}
+        }
+        // A live job/jog can move during an outage. Its coordinates remain authoritative;
+        // do not defer a stale restoration until the motion finishes.
+        if self.s.status.state == "Run"
+            || self.s.status.state == "Jog"
+            || self.s.status.state.starts_with("Hold")
+            || self.s.status.file.is_some()
+        {
+            self.coordinate_recovery = CoordinateRecovery::Ready;
+            self.s
+                .log("Controller is active; keeping its live work coordinates");
+            return Ok(true);
+        }
+        let Some(target) = self.coordinates.get(&self.address) else {
+            self.coordinate_recovery = CoordinateRecovery::Ready;
+            return Ok(true);
+        };
+        // Unlock is available while waiting in Alarm. No automatic unlock or motion.
+        if !self.selected_work_system
+            || !self.s.status.idle()
+            || !self.s.status.position_known
+            || !self.s.status.wco_known
+            || self.s.status.accessory_at.is_none()
+            || self.s.status.torch
+        {
+            return Ok(false);
+        }
+        if self.s.status.wpos.distance(target) <= self.coordinate_tolerance() {
+            self.coordinate_recovery = CoordinateRecovery::Ready;
+            return Ok(true);
+        }
+        self.s.initialized = false;
+        self.s.phase = "Restoring work coordinates…".into();
+        self.coordinate_recovery = CoordinateRecovery::Writing;
+        self.queue.push_back("G21".into());
+        self.queue
+            .push_back(format!("G10L20P1X{:.6}Y{:.6}Z{:.6}", target.x, target.y, target.z).into());
+        if !self.s.options.initial_mm {
+            self.queue.push_back("G20".into());
+        }
+        self.queue.push_back("$G".into());
+        self.preview_dirty = true;
+        Ok(false)
+    }
+    fn checkpoint_coordinates(&mut self) {
+        let can_checkpoint = self.s.connected
+            && self.s.initialized
+            && matches!(self.coordinate_recovery, CoordinateRecovery::Ready)
+            && self.s.status.fresh()
+            && self.s.status.position_known
+            && self.s.status.wco_known
+            && self
+                .pending
+                .as_ref()
+                .is_none_or(|(cmd, _)| cmd.starts_with("$LocalFS/Run=") || cmd.starts_with("$J="))
+            && self.queue.is_empty();
+        if !can_checkpoint {
+            return;
+        }
+        if let Err(e) = self.coordinates.record(&self.address, self.s.status.wpos)
+            && !self.checkpoint_error
+        {
+            self.fail(format!(
+                "Cannot save coordinates across app restarts: {e:#}"
+            ));
+            self.checkpoint_error = true;
+        }
     }
     fn line(&mut self, line: &str) -> Result<()> {
         self.s.console(line);
@@ -667,7 +804,12 @@ impl Worker {
             }
             return Ok(());
         }
-        if line.starts_with("Grbl ") && (self.s.initialized || self.reset_wait.is_some()) {
+        if line.starts_with("Grbl ")
+            && (self.s.initialized
+                || self.reset_wait.is_some()
+                || self.init_started
+                || self.got_units)
+        {
             self.trace = None;
             self.s.tracing = false;
             self.stopping = None;
@@ -680,6 +822,9 @@ impl Worker {
             self.s.initialized = false;
             self.init_started = false;
             self.selected_work_system = false;
+            self.coordinate_recovery = CoordinateRecovery::Pending;
+            self.s.status = Status::default();
+            self.s.status.state = "Connecting".into();
             self.got_units = false;
             self.auto_reports = false;
             self.queue.push_back("$report_inches".into());
@@ -753,6 +898,13 @@ impl Worker {
         {
             if line.starts_with("error:") {
                 self.fail(format!("{cmd}: {line}"));
+                if matches!(self.coordinate_recovery, CoordinateRecovery::Writing)
+                    || (!self.s.initialized && cmd == "G54")
+                {
+                    self.coordinate_recovery = CoordinateRecovery::Failed;
+                    self.queue.clear();
+                    self.s.initialized = false;
+                }
                 if cmd.starts_with("$LocalFS/Run=") {
                     self.realtime(&[protocol::RESET])?;
                     self.s.job = false;
@@ -769,6 +921,10 @@ impl Worker {
                 self.finish();
             }
             if line == "ok" {
+                if cmd.starts_with("G10") {
+                    self.s.status.wco_known = false;
+                    self.s.status.position_known = false;
+                }
                 if cmd == "$Report/Interval=100" {
                     self.auto_reports = true;
                 }
@@ -1228,6 +1384,7 @@ impl Worker {
         self.s.initialized = false;
         self.init_started = false;
         self.selected_work_system = false;
+        self.coordinate_recovery = CoordinateRecovery::Pending;
         self.got_units = false;
         self.auto_reports = false;
         self.reset_wait = Some(Instant::now());

@@ -98,7 +98,11 @@ pub struct App {
 impl App {
     pub fn new(settings: Settings, demo: bool) -> Self {
         Self {
-            controller: Controller::start(settings.address.clone(), settings.http.clone()),
+            controller: Controller::start(
+                settings.address.clone(),
+                settings.http.clone(),
+                (!demo).then(crate::coordinates::Coordinates::path),
+            ),
             snapshot: Snapshot::default(),
             settings,
             dro: ["0.000".into(), "0.000".into()],

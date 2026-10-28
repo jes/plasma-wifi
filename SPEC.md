@@ -104,7 +104,7 @@ https://github.com/bdring/FluidNC/issues/330 this github issue may be useful, we
 I have put my active config.yaml in this dir, you can make changes to it as required and I will install it using the WebUI. And just preprocess
 the gcode to set the N numbers, no big deal.
 
-Try to auto-reconnect to the socket if disconnected.
+Try to auto-reconnect to the socket if disconnected. Persist the latest reported work coordinates per controller, and restore them without motion after reconnects, app restarts, FluidNC reboots, or both, assuming the toolhead has not moved. Verify restored coordinates before enabling jogging or Run; keep live coordinates if reconnecting to an active controller, and wait for explicit alarm unlock when required.
 
 Check file size after uploading, and potentially verify file contents if quick and easy to do.
 

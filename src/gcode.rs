@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use std::f64::consts::TAU;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Point {
     pub x: f64,
     pub y: f64,

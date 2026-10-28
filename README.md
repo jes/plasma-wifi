@@ -35,7 +35,9 @@ Install the supplied `config.yaml` through the FluidNC WebUI before using active
 - The G-code panel switches between original and uploaded lines. Auto-scroll follows the active motion line; FluidNC may omit line numbers during a dwell or between planner blocks, so the most recent known line remains highlighted.
 - The preview uses subdued cyan rapid moves, prominent orange feed moves, and distinct active/completed segments. Drag to pan, wheel to zoom, and **Fit** to reset the view.
 
-Files cannot be replaced during running or paused jobs. Run is gated on verified contents and fresh idle controller status. Reconnection queries state without replaying Run, coordinate writes, or jogs. Elapsed time is marked uncertain after a connection gap because an unobserved pause or override change cannot be reconstructed exactly.
+The latest reported X/Y/Z work position is saved per controller TCP address and restored automatically after reconnection, app restarts, FluidNC reboots, or both. This assumes the toolhead has not moved since its last saved report. Restoration changes offsets without moving or homing, and is verified before jogging or Run is enabled. Existing matching coordinates need no write; running, jogging, or held controllers keep their live coordinates. If FluidNC is in Alarm, use **Unlock alarm** before restoration can proceed. A rejected or unverified restoration blocks motion controls and preserves the checkpoint for another reconnect. FluidNC's machine coordinates (`G53`) still reset on a firmware reboot; restoration preserves the work coordinates used by the DRO and `G54` jobs.
+
+Files cannot be replaced during running or paused jobs. Run is gated on verified contents and fresh idle controller status. Reconnection queries state without replaying Run, manual coordinate edits, or jogs. Elapsed time is marked uncertain after a connection gap because an unobserved pause or override change cannot be reconstructed exactly.
 
 ## G-code and timing
 
@@ -56,7 +58,7 @@ rustup target add x86_64-unknown-linux-musl
 cargo test --locked --release --target x86_64-unknown-linux-musl
 ```
 
-Cargo fetches the Rust dependencies. `Cargo.lock` pins them. Settings are saved under `$XDG_CONFIG_HOME/plasma-wifi/settings.json`, or `~/.config/plasma-wifi/settings.json`.
+Cargo fetches the Rust dependencies. `Cargo.lock` pins them. Settings are saved under `$XDG_CONFIG_HOME/plasma-wifi/settings.json`, or `~/.config/plasma-wifi/settings.json`. Coordinate checkpoints are written atomically under `$XDG_STATE_HOME/plasma-wifi/coordinates.json`, or `~/.local/state/plasma-wifi/coordinates.json`, as reports arrive. Demo mode keeps coordinates in memory and does not read or write these checkpoints.
 
 To explore without hardware:
 
