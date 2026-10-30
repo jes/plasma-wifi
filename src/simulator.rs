@@ -359,6 +359,7 @@ fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()
     let mut line = Vec::new();
     let mut interval = None;
     let mut last_report = Instant::now();
+    let mut last_report_state = String::new();
     loop {
         {
             let mut m = state.lock().unwrap();
@@ -370,8 +371,18 @@ fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()
                 interval = None;
                 stream.write_all(b"Grbl 4.1 [FluidNC v4.1.1 simulator]\n")?;
             }
-            if interval.is_some_and(|interval| last_report.elapsed() >= interval) {
+            // FluidNC auto-reports periodically during motion, but in Idle only
+            // reports changes. Explicit ? queries still produce sparse reports.
+            if interval.is_some_and(|interval| {
+                m.report_wco != m.wco
+                    || m.report_feed != m.feed
+                    || m.report_torch != m.torch
+                    || m.state() != last_report_state
+                    || matches!(m.state(), "Run" | "Jog" | "Hold:1")
+                        && last_report.elapsed() >= interval
+            }) {
                 stream.write_all(m.status(interval.is_some()).as_bytes())?;
+                last_report_state = m.state().into();
                 last_report = Instant::now();
             }
             if m.complete {
@@ -629,6 +640,7 @@ mod tests {
                 s.status.position_known && (s.status.wpos.x - 12.0).abs() < 0.001
             });
             controller.send(Action::Jog {
+                step: 1.0,
                 x: 1.0,
                 y: 0.0,
                 speed: 600.0,
@@ -699,6 +711,29 @@ mod tests {
         let s = restored(&controller, target);
         assert!(s.status.mpos.distance(Point::default()) < 0.001);
         assert!(checkpoint.saved(&sim).unwrap().distance(target) < 1e-9);
+    }
+    #[test]
+    fn restoration_with_sparse_idle_reports_enables_jogging_without_stop() {
+        let sim = Simulator::start().unwrap();
+        let checkpoint = CheckpointFile::new();
+        let target = seed_position(&sim);
+        let controller = checkpoint.start(&sim);
+        restored(&controller, target);
+        drop(controller);
+        sim.reboot(true);
+        let baseline = sim.commands().len();
+        let controller = checkpoint.start(&sim);
+        let s = restored(&controller, target);
+        assert!(s.can_jog() && s.error.is_none());
+        assert_ne!(s.phase, "Restoring work coordinates…");
+        assert_eq!(
+            sim.commands()[baseline..]
+                .iter()
+                .filter(|c| c.starts_with("G10"))
+                .count(),
+            1
+        );
+        assert!(s.status.mpos.distance(Point::default()) < 0.001);
     }
     #[test]
     fn inch_reports_and_modal_units_survive_coordinate_restoration() {
@@ -864,6 +899,7 @@ mod tests {
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Jog {
+            step: 1.0,
             x: 1.0,
             y: 0.0,
             speed: 600.0,

@@ -23,6 +23,9 @@ pub struct Settings {
     pub address: String,
     pub http: String,
     pub jog_speed: f64,
+    pub jog_increment: f64,
+    pub rapid_jog: bool,
+    pub shift_jog: bool,
     pub last_dir: PathBuf,
 }
 impl Default for Settings {
@@ -31,6 +34,9 @@ impl Default for Settings {
             address: "192.168.0.1:23".into(),
             http: "http://192.168.0.1".into(),
             jog_speed: 600.0,
+            jog_increment: 1.0,
+            rapid_jog: false,
+            shift_jog: false,
             last_dir: std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(".")),
@@ -81,6 +87,7 @@ pub struct App {
     settings_open: bool,
     log_open: bool,
     console_open: bool,
+    console_focus: bool,
     console_input: String,
     console_history: Vec<String>,
     console_index: usize,
@@ -91,6 +98,7 @@ pub struct App {
     hull_program: Option<Arc<Program>>,
     error: Option<String>,
     was_jogging: bool,
+    jog_interrupted: bool,
     zoom: f32,
     pan: Vec2,
     demo: bool,
@@ -116,6 +124,7 @@ impl App {
             settings_open: false,
             log_open: false,
             console_open: false,
+            console_focus: false,
             console_input: String::new(),
             console_history: Vec::new(),
             console_index: 0,
@@ -126,6 +135,7 @@ impl App {
             hull_program: None,
             error: None,
             was_jogging: false,
+            jog_interrupted: false,
             zoom: 1.0,
             pan: Vec2::ZERO,
             demo,
@@ -202,6 +212,19 @@ impl App {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::O)) {
             self.open_chooser();
         }
+        if !ctx.egui_wants_keyboard_input()
+            && ctx.input(|i| i.focused)
+            && self.picker.is_none()
+            && !self.settings_open
+            && !self.log_open
+            && let Some(prefix) = ctx.input_mut(|i| take_console_prefix(&mut i.events))
+        {
+            self.console_input = prefix.to_string();
+            self.console_draft = self.console_input.clone();
+            self.console_index = self.console_history.len();
+            self.console_open = true;
+            self.console_focus = true;
+        }
         egui::Panel::top("header").show_inside(root, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -218,6 +241,7 @@ impl App {
                     }
                     if ui.button("Console").clicked() {
                         self.console_open = !self.console_open;
+                        self.console_focus = self.console_open;
                     }
                     if ui.button("Log").clicked() {
                         self.log_open = !self.log_open;
@@ -478,7 +502,22 @@ impl App {
         ));
         ui.add_space(10.0);
         ui.separator();
-        ui.label(RichText::new("JOG  /  hold to move").color(CYAN).strong());
+        ui.label(RichText::new("JOG  /  tap or hold").color(CYAN).strong());
+        ui.horizontal(|ui| {
+            ui.label("Increment");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.settings.jog_increment)
+                        .range(0.001..=100.0)
+                        .speed(0.1)
+                        .suffix(" mm"),
+                )
+                .changed()
+                && !self.demo
+            {
+                self.settings.save();
+            }
+        });
         ui.horizontal(|ui| {
             ui.label("Speed");
             if ui
@@ -502,13 +541,20 @@ impl App {
                     .spacing([5.0, 5.0])
                     .show(ui, |ui| {
                         for row in [
-                            [("↖", -1.0, 1.0), ("Y+", 0.0, 1.0), ("↗", 1.0, 1.0)],
-                            [("X−", -1.0, 0.0), ("•", 0.0, 0.0), ("X+", 1.0, 0.0)],
-                            [("↙", -1.0, -1.0), ("Y−", 0.0, -1.0), ("↘", 1.0, -1.0)],
+                            [("", 0.0, 0.0), ("Y+", 0.0, 1.0), ("", 0.0, 0.0)],
+                            [("X−", -1.0, 0.0), ("", 0.0, 0.0), ("X+", 1.0, 0.0)],
+                            [("", 0.0, 0.0), ("Y−", 0.0, -1.0), ("", 0.0, 0.0)],
                         ] {
                             for (label, x, y) in row {
-                                let response = ui.add_sized([72.0, 38.0], egui::Button::new(label));
-                                if response.is_pointer_button_down_on() && (x != 0.0 || y != 0.0) {
+                                if label.is_empty() {
+                                    ui.allocate_space(egui::vec2(72.0, 32.0));
+                                    continue;
+                                }
+                                let response = ui.add_sized([72.0, 32.0], egui::Button::new(label));
+                                if response.is_pointer_button_down_on()
+                                    && response.contains_pointer()
+                                    || response.clicked()
+                                {
                                     pointer_jog = Some((x, y));
                                 }
                             }
@@ -519,7 +565,22 @@ impl App {
         );
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new("pointer_jog"), pointer_jog));
-        ui.small("Arrow keys jog when no text field is focused.");
+        ui.horizontal(|ui| {
+            let changed = ui
+                .checkbox(&mut self.settings.rapid_jog, "Rapid ×4")
+                .on_hover_text("Four times the selected feed, capped at 3000 mm/min")
+                .changed();
+            let changed = ui
+                .checkbox(&mut self.settings.shift_jog, "Shift jog")
+                .on_hover_text("Require Shift for keyboard jogging")
+                .changed()
+                || changed;
+            if changed && !self.demo {
+                self.settings.save();
+            }
+        });
+        ui.small("Tap: one increment · hold: keep moving");
+        ui.small("Arrow keys: X/Y · Esc: cancel jog");
         ui.small(format!(
             "Torch: {}",
             if self.snapshot.status.torch {
@@ -554,25 +615,51 @@ impl App {
         let pointer = ctx
             .data(|d| d.get_temp::<Option<(f64, f64)>>(egui::Id::new("pointer_jog")))
             .flatten();
-        let direction = if !ctx.input(|i| i.focused)
+        let interrupted = !ctx.input(|i| i.focused)
             || self.picker.is_some()
             || self.settings_open
             || self.console_open
             || self.log_open
-        {
+            || ctx.input(|i| i.key_down(egui::Key::Escape) || i.key_pressed(egui::Key::Escape))
+            || !self.snapshot.can_jog()
+            || self.snapshot.status.torch;
+        let direction = if interrupted {
             None
         } else if pointer.is_some() {
             pointer
         } else if !ctx.egui_wants_keyboard_input() {
             ctx.input(|i| {
+                let allowed = |modifiers: egui::Modifiers| {
+                    !modifiers.ctrl
+                        && !modifiers.alt
+                        && !modifiers.command
+                        && (!self.settings.shift_jog || modifiers.shift)
+                };
                 let x = i.key_down(egui::Key::ArrowRight) as i32
                     - i.key_down(egui::Key::ArrowLeft) as i32;
                 let y =
                     i.key_down(egui::Key::ArrowUp) as i32 - i.key_down(egui::Key::ArrowDown) as i32;
-                if x != 0 || y != 0 {
+                if (x != 0 || y != 0) && allowed(i.modifiers) {
                     Some((x as f64, y as f64))
                 } else {
-                    None
+                    // A tap, including Shift, can begin and end between frames.
+                    // Use the modifiers at key-down rather than after release.
+                    i.events.iter().find_map(|event| match event {
+                        egui::Event::Key {
+                            key,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } if allowed(*modifiers) => match key {
+                            egui::Key::ArrowRight => Some((1.0, 0.0)),
+                            egui::Key::ArrowLeft => Some((-1.0, 0.0)),
+                            egui::Key::ArrowUp => Some((0.0, 1.0)),
+                            egui::Key::ArrowDown => Some((0.0, -1.0)),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
                 }
             })
         } else {
@@ -584,13 +671,25 @@ impl App {
             self.controller.send(Action::Jog {
                 x,
                 y,
-                speed: self.settings.jog_speed,
+                speed: (self.settings.jog_speed * if self.settings.rapid_jog { 4.0 } else { 1.0 })
+                    .min(3000.0),
+                step: self.settings.jog_increment,
             });
             self.was_jogging = true;
         } else if self.was_jogging {
-            self.controller.send(Action::CancelJog);
+            self.controller
+                .send(if interrupted || ctx.egui_wants_keyboard_input() {
+                    Action::CancelJog
+                } else {
+                    Action::FinishJog
+                });
             self.was_jogging = false;
         }
+        // A released increment may still be completing when focus is lost.
+        if interrupted && !self.jog_interrupted && !self.snapshot.tracing {
+            self.controller.send(Action::CancelJog);
+        }
+        self.jog_interrupted = interrupted;
     }
     fn preview(&mut self, ui: &mut egui::Ui, height: f32) {
         ui.horizontal(|ui| {
@@ -938,12 +1037,22 @@ impl App {
                         }
                     });
                 ui.horizontal(|ui| {
-                    let field = ui.add(
-                        egui::TextEdit::singleline(&mut self.console_input)
+                    let id = ui.make_persistent_id("console_command");
+                    let mut output = egui::TextEdit::singleline(&mut self.console_input)
+                            .id(id)
                             .desired_width((ui.available_width() - 65.0).max(100.0))
                             .font(egui::TextStyle::Monospace)
-                            .hint_text("FluidNC command"),
-                    );
+                            .hint_text("FluidNC command")
+                            .show(ui);
+                    let field = output.response;
+                    if self.console_focus && ui.is_visible() {
+                        field.request_focus();
+                        output.state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                            egui::text::CCursor::new(self.console_input.chars().count()),
+                        )));
+                        output.state.store(ctx, id);
+                        self.console_focus = false;
+                    }
                     if field.has_focus() || field.lost_focus() {
                         if ui.input(|i| i.key_pressed(egui::Key::ArrowUp))
                             && self.console_index > 0
@@ -986,6 +1095,34 @@ impl App {
             });
         self.console_open = open;
     }
+}
+fn take_console_prefix(events: &mut Vec<egui::Event>) -> Option<char> {
+    let (index, prefix) = events
+        .iter()
+        .enumerate()
+        .find_map(|(index, event)| match event {
+            egui::Event::Key {
+                key,
+                pressed: true,
+                repeat: false,
+                modifiers,
+                ..
+            } if !modifiers.ctrl && !modifiers.alt && !modifiers.command => match key {
+                egui::Key::G => Some((index, 'G')),
+                egui::Key::M => Some((index, 'M')),
+                _ => None,
+            },
+            _ => None,
+        })?;
+    events.remove(index);
+    // The X11 backend also emits text for the shortcut key. Consume that one
+    // character so the newly focused field starts with G/M exactly once.
+    if let Some(offset) = events[index..].iter().position(|event| {
+        matches!(event, egui::Event::Text(text) if text.eq_ignore_ascii_case(&prefix.to_string()))
+    }) {
+        events.remove(index + offset);
+    }
+    Some(prefix)
 }
 fn duration(seconds: f64) -> String {
     if !seconds.is_finite() {

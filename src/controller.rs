@@ -17,20 +17,37 @@ use std::{
 
 #[derive(Clone, Debug)]
 pub enum Action {
-    Load { name: String, text: String },
+    Load {
+        name: String,
+        text: String,
+    },
     Run,
     Pause,
     Resume,
     Stop,
     Unlock,
     Console(String),
-    TraceHull { speed: f64 },
+    TraceHull {
+        speed: f64,
+    },
     CancelTrace,
     Feed(u8),
-    Jog { x: f64, y: f64, speed: f64 },
+    Jog {
+        x: f64,
+        y: f64,
+        speed: f64,
+        step: f64,
+    },
+    FinishJog,
     CancelJog,
-    SetCoordinate { axis: char, value: f64 },
-    Connect { address: String, http: String },
+    SetCoordinate {
+        axis: char,
+        value: f64,
+    },
+    Connect {
+        address: String,
+        http: String,
+    },
 }
 
 #[derive(Clone)]
@@ -110,6 +127,8 @@ impl Snapshot {
         self.connected
             && self.initialized
             && self.status.fresh()
+            && self.status.position_known
+            && self.status.wco_known
             && !self.job
             && !self.transferring
             && !self.tracing
@@ -169,6 +188,18 @@ struct Trace {
     next: usize,
     sent: Option<Instant>,
     speed: f64,
+}
+
+struct ManualJog {
+    x: f64,
+    y: f64,
+    speed: f64,
+    step: f64,
+    target: Point,
+    heartbeat: Instant,
+    extended: Instant,
+    sent: bool,
+    released: bool,
 }
 
 pub struct Controller {
@@ -318,8 +349,7 @@ struct Worker {
     pause: PauseState,
     tracker: Tracker,
     last_tick: Instant,
-    jog: Option<(f64, f64, f64, Instant)>,
-    last_jog: Instant,
+    jog: Option<ManualJog>,
     inches: bool,
     got_units: bool,
     init_started: bool,
@@ -368,7 +398,6 @@ impl Worker {
             },
             last_tick: now,
             jog: None,
-            last_jog: now,
             inches: false,
             got_units: false,
             init_started: false,
@@ -590,6 +619,12 @@ impl Worker {
         }
         if self.pending.is_none() {
             if let Some(command) = self.queue.pop_front() {
+                // An offset-change auto report can arrive before the command's ok.
+                // Invalidate before sending so that report remains usable.
+                if command.starts_with("G10") || command == "G54" || command == "G21G54" {
+                    self.s.status.wco_known = false;
+                    self.s.status.position_known = false;
+                }
                 self.link.as_mut().unwrap().command(&command)?;
                 self.s.console(format!("> {command}"));
                 self.pending = Some((command, Instant::now()));
@@ -619,9 +654,9 @@ impl Worker {
             CoordinateRecovery::Ready => return Ok(true),
             CoordinateRecovery::Failed => return Ok(false),
             CoordinateRecovery::Writing => {
-                // All writes, including modal-unit restoration, have been acknowledged.
-                // Discard reports received before their acknowledgements.
-                self.s.status.wco_known = false;
+                // Keep the WCO reported since the offset write. FluidNC sends it
+                // on change, then omits it from most Idle reports. Only request
+                // a fresh position after all writes have been acknowledged.
                 self.s.status.position_known = false;
                 self.coordinate_recovery = CoordinateRecovery::Verifying(Instant::now());
                 self.realtime(b"?")?;
@@ -640,6 +675,7 @@ impl Worker {
                 }
                 if started.elapsed() > Duration::from_secs(3) {
                     self.coordinate_recovery = CoordinateRecovery::Failed;
+                    self.s.phase = "Coordinate restoration failed".into();
                     self.fail(
                         "Coordinate restoration could not be verified; reconnect to retry".into(),
                     );
@@ -902,6 +938,7 @@ impl Worker {
                     || (!self.s.initialized && cmd == "G54")
                 {
                     self.coordinate_recovery = CoordinateRecovery::Failed;
+                    self.s.phase = "Coordinate restoration failed".into();
                     self.queue.clear();
                     self.s.initialized = false;
                 }
@@ -921,10 +958,6 @@ impl Worker {
                 self.finish();
             }
             if line == "ok" {
-                if cmd.starts_with("G10") {
-                    self.s.status.wco_known = false;
-                    self.s.status.position_known = false;
-                }
                 if cmd == "$Report/Interval=100" {
                     self.auto_reports = true;
                 }
@@ -1120,7 +1153,7 @@ impl Worker {
                 self.realtime(b"?")?;
                 self.poll = Instant::now();
             }
-            Action::Jog { x, y, speed } => {
+            Action::Jog { x, y, speed, step } => {
                 ensure!(
                     self.s.can_jog() && !self.s.status.torch,
                     "Jogging requires an idle machine and torch off"
@@ -1129,19 +1162,60 @@ impl Worker {
                     speed.is_finite()
                         && (1.0..=3000.0).contains(&speed)
                         && x.is_finite()
-                        && y.is_finite(),
-                    "Invalid jog speed/direction"
+                        && y.is_finite()
+                        && (x != 0.0 || y != 0.0)
+                        && step.is_finite()
+                        && (0.001..=100.0).contains(&step),
+                    "Invalid jog speed, direction or increment"
                 );
-                self.jog = Some((
-                    x.clamp(-1.0, 1.0),
-                    y.clamp(-1.0, 1.0),
+                let length = x.hypot(y);
+                let (x, y) = (x / length, y / length);
+                if let Some(jog) = &mut self.jog
+                    && (jog.x, jog.y, jog.speed, jog.step) == (x, y, speed, step)
+                {
+                    jog.heartbeat = Instant::now();
+                    return Ok(());
+                }
+                if self.jog.is_some() {
+                    self.action(Action::CancelJog)?;
+                }
+                self.jog = Some(ManualJog {
+                    x,
+                    y,
                     speed,
-                    Instant::now(),
-                ));
+                    step,
+                    target: Point {
+                        x: self.s.status.wpos.x + x * step,
+                        y: self.s.status.wpos.y + y * step,
+                        z: self.s.status.wpos.z,
+                    },
+                    heartbeat: Instant::now(),
+                    extended: Instant::now(),
+                    sent: false,
+                    released: false,
+                });
                 self.preview_dirty = true;
             }
+            Action::FinishJog => {
+                // A normal release completes the selected increment, including a
+                // short tap. Focus loss, Stop and heartbeat expiry cancel instead.
+                if let Some(jog) = &mut self.jog {
+                    jog.released = true;
+                    if jog.sent {
+                        self.jog = None;
+                    }
+                }
+            }
             Action::CancelJog => {
-                if !self.s.tracing && (self.jog.take().is_some() || self.s.status.state == "Jog") {
+                if !self.s.tracing
+                    && (self.jog.take().is_some()
+                        || self.s.status.state == "Jog"
+                        || self.queue.iter().any(|cmd| cmd.starts_with("$J="))
+                        || self
+                            .pending
+                            .as_ref()
+                            .is_some_and(|(cmd, _)| cmd.starts_with("$J=")))
+                {
                     self.queue.retain(|c| !c.starts_with("$J="));
                     self.realtime(&[protocol::JOG_CANCEL])?;
                 }
@@ -1345,28 +1419,51 @@ impl Worker {
         Ok(())
     }
     fn advance_jog(&mut self) -> Result<()> {
-        if let Some((x, y, speed, heartbeat)) = self.jog {
-            if heartbeat.elapsed() > Duration::from_millis(250) || !self.s.can_jog() {
-                self.jog = None;
-                self.queue.retain(|c| !c.starts_with("$J="));
-                self.realtime(&[protocol::JOG_CANCEL])?;
-            } else if self.pending.is_none()
-                && self.queue.is_empty()
-                && self.last_jog.elapsed() > Duration::from_millis(100)
+        let Some(jog) = &mut self.jog else {
+            return Ok(());
+        };
+        if jog.heartbeat.elapsed() > Duration::from_millis(250)
+            || !self.s.can_jog()
+            || self.s.status.torch
+        {
+            self.action(Action::CancelJog)?;
+            return Ok(());
+        }
+        if self.pending.is_some() || !self.queue.is_empty() {
+            return Ok(());
+        }
+        if jog.sent {
+            if jog.extended.elapsed() < Duration::from_millis(100)
+                // Keep only a small distance ahead of reported motion. A slow
+                // controller must not accumulate a growing queue of increments.
+                || jog.target.distance(self.s.status.wpos) > jog.speed / 600.0 + 0.001
             {
-                // Short commands plus a UI heartbeat bound motion if the UI stalls.
-                let length = (x * x + y * y).sqrt().max(1.0);
-                let distance = speed / 60.0 * 0.12;
-                self.queue.push_back(
-                    format!(
-                        "$J=G21G91X{:.5}Y{:.5}F{speed:.1}",
-                        x / length * distance,
-                        y / length * distance
-                    )
-                    .into(),
-                );
-                self.last_jog = Instant::now();
+                return Ok(());
             }
+            let distance = (jog.speed / 600.0 / jog.step).ceil().max(1.0) * jog.step;
+            jog.target.x += jog.x * distance;
+            jog.target.y += jog.y * distance;
+        }
+        let command = if jog.sent {
+            format!(
+                "$J=G21G90X{:.5}Y{:.5}F{:.1}",
+                jog.target.x, jog.target.y, jog.speed
+            )
+        } else {
+            // Each tap is relative so consecutive taps still move one increment
+            // each when they arrive faster than position feedback.
+            format!(
+                "$J=G21G91X{:.5}Y{:.5}F{:.1}",
+                jog.x * jog.step,
+                jog.y * jog.step,
+                jog.speed
+            )
+        };
+        self.queue.push_back(command.into());
+        jog.sent = true;
+        jog.extended = Instant::now();
+        if jog.released {
+            self.jog = None;
         }
         Ok(())
     }
@@ -1574,6 +1671,122 @@ impl<'a> LinkOption<'a> for Option<&'a mut Link> {
 mod tests {
     use super::*;
     use crate::gcode::Point;
+
+    fn connected_worker() -> (crate::simulator::Simulator, Worker) {
+        let sim = crate::simulator::Simulator::start().unwrap();
+        let (_tx, rx) = mpsc::channel();
+        let mut worker = Worker::new(
+            sim.address.clone(),
+            sim.http.clone(),
+            rx,
+            Arc::new(Mutex::new(Snapshot::default())),
+        );
+        worker.link = Some(Link::connect(&sim.address).unwrap());
+        worker.s.connected = true;
+        worker.s.initialized = true;
+        worker.got_units = true;
+        worker
+            .s
+            .status
+            .update("<Idle|MPos:10,20,0|WCO:0,0,0|Ov:100,100,100>", false);
+        (sim, worker)
+    }
+
+    #[test]
+    fn offset_report_before_ack_survives_restore_verification() {
+        let (_sim, mut worker) = connected_worker();
+        let target = Point {
+            x: 42.0,
+            y: 25.0,
+            z: 0.0,
+        };
+        worker.coordinates.record(&worker.address, target).unwrap();
+        worker.coordinate_recovery = CoordinateRecovery::Writing;
+        worker.pending = Some(("G10L20P1X42Y25Z0".into(), Instant::now()));
+        worker.s.status.wco_known = false;
+        worker.s.status.position_known = false;
+        worker.line("<Idle|MPos:10,20,0|WCO:-32,-5,0>").unwrap();
+        worker.line("ok").unwrap();
+        assert!(!worker.recover_coordinates().unwrap());
+        worker.line("<Idle|MPos:10,20,0>").unwrap();
+        assert!(worker.recover_coordinates().unwrap());
+        assert_eq!(worker.s.status.wpos, target);
+        assert_eq!(worker.s.status.mpos.x, 10.0);
+    }
+
+    #[test]
+    fn quick_jog_tap_completes_exactly_one_increment() {
+        let (_sim, mut worker) = connected_worker();
+        worker
+            .action(Action::Jog {
+                x: 1.0,
+                y: 0.0,
+                speed: 600.0,
+                step: 0.25,
+            })
+            .unwrap();
+        // Both input messages may arrive before the worker's next motion tick.
+        worker.action(Action::FinishJog).unwrap();
+        worker.advance_jog().unwrap();
+        assert_eq!(worker.queue.len(), 1);
+        assert_eq!(worker.queue[0], "$J=G21G91X0.25000Y0.00000F600.0");
+        assert!(worker.jog.is_none());
+        worker.advance_jog().unwrap();
+        assert_eq!(worker.queue.len(), 1);
+    }
+
+    #[test]
+    fn held_jog_extends_in_increments_without_building_a_backlog() {
+        let (_sim, mut worker) = connected_worker();
+        worker
+            .action(Action::Jog {
+                x: 0.0,
+                y: -1.0,
+                speed: 600.0,
+                step: 0.3,
+            })
+            .unwrap();
+        worker.advance_jog().unwrap();
+        worker.queue.clear(); // First command acknowledged.
+        worker.s.status.wpos.y = 19.7;
+        worker.jog.as_mut().unwrap().extended = Instant::now() - Duration::from_millis(101);
+        worker.advance_jog().unwrap();
+        assert_eq!(worker.queue[0], "$J=G21G90X10.00000Y18.50000F600.0");
+        worker.queue.clear();
+        // Without position progress, repeated heartbeats must not run farther ahead.
+        for _ in 0..5 {
+            worker.jog.as_mut().unwrap().extended = Instant::now() - Duration::from_millis(101);
+            worker.advance_jog().unwrap();
+            assert!(worker.queue.is_empty());
+        }
+        worker.jog.as_mut().unwrap().heartbeat = Instant::now() - Duration::from_millis(251);
+        worker.advance_jog().unwrap();
+        assert!(worker.jog.is_none() && worker.queue.is_empty());
+        assert!(worker.s.console.back().unwrap().contains("cancel jog"));
+    }
+
+    #[test]
+    fn cancel_after_releasing_a_tap_removes_unsent_motion() {
+        let (_sim, mut worker) = connected_worker();
+        worker
+            .action(Action::Jog {
+                x: 1.0,
+                y: 0.0,
+                speed: 600.0,
+                step: 1.0,
+            })
+            .unwrap();
+        worker.advance_jog().unwrap();
+        worker.action(Action::FinishJog).unwrap();
+        worker.action(Action::CancelJog).unwrap();
+        assert!(worker.jog.is_none() && worker.queue.is_empty());
+        // Cancellation must also work after transmission, before either the ack
+        // or the first Jog status report has arrived.
+        let cancelled = worker.s.console.len();
+        worker.pending = Some(("$J=G21G91X1F600".into(), Instant::now()));
+        worker.action(Action::CancelJog).unwrap();
+        assert_eq!(worker.s.console.len(), cancelled + 1);
+    }
     #[test]
     fn fluidnc_modal_feed_is_already_mm_per_minute_in_inch_mode() {
         let (_tx, rx) = mpsc::channel();

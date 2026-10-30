@@ -76,6 +76,7 @@ try:
     # Editing the DRO changes the work offset, never physical position.
     before = state()
     click(110, 113)
+    command("key", "g", "m")  # G/M shortcuts must leave the focused DRO alone.
     command("key", "ctrl+a")
     command("type", "--clearmodifiers", "42")
     command("key", "Return")
@@ -97,6 +98,17 @@ try:
 
     click(450, 400)  # clear text focus
     before = state()
+    count = len([c for c in before["commands"] if c.startswith("$J=")])
+    command("key", "Right")
+    tapped = wait(lambda s: s["state"] == "Idle" and abs(s["mpos_x"] - before["mpos_x"] - 1) < 0.001,
+                  "Quick arrow tap did not move one increment")
+    assert len([c for c in tapped["commands"] if c.startswith("$J=")]) == count + 1
+    before = state()
+    click(120, 556)  # Y+ must also work for a quick mouse click.
+    wait(lambda s: s["state"] == "Idle" and abs(s["mpos_y"] - before["mpos_y"] - 1) < 0.001,
+         "Mouse tap did not move one increment")
+    click(450, 400)
+    before = state()
     command("keydown", "Right")
     time.sleep(0.45)
     command("keyup", "Right")
@@ -113,6 +125,20 @@ try:
     command("keyup", "Left")
     command("windowfocus", window)
     time.sleep(0.3)  # receive the cancellation status before clicking Run
+
+    click(15, 658)  # Rapid x4
+    click(92, 658)  # Require Shift for keyboard jogs.
+    click(450, 400)
+    before = state()
+    command("key", "Right")
+    time.sleep(0.2)
+    assert state()["mpos_x"] == before["mpos_x"], "Shift jog allowed an unmodified arrow"
+    command("key", "shift+Right")
+    rapid = wait(lambda s: s["state"] == "Idle" and abs(s["mpos_x"] - before["mpos_x"] - 1) < 0.001,
+                 "Shift+arrow did not jog one increment")
+    assert any(c.startswith("$J=") and c.endswith("F2400.0") for c in rapid["commands"]), "Rapid did not multiply jog feed"
+    click(15, 658)
+    click(92, 658)
 
     click(45, 223)  # Run
     wait(lambda s: s["state"] == "Run" and s["torch"], "Run did not ignite torch")
@@ -137,11 +163,11 @@ try:
     time.sleep(1.0)  # reset handshake and verification
 
     # Console text entry and history must never trigger arrow-key jogging.
-    click(1080, 22)
+    click(450, 400)
+    command("key", "g")
     time.sleep(0.4)
     screenshot("console.png")
-    click(300, 424)
-    command("type", "--clearmodifiers", "G10L20P1X12.345")
+    command("type", "--clearmodifiers", "10L20P1X12.345")
     command("key", "Return")
     wait(lambda s: abs(s["x"]-12.345)<0.001, "Console command did not apply")
     time.sleep(0.25)
@@ -154,7 +180,19 @@ try:
     command("type", "--clearmodifiers", "$I")
     command("key", "Up", "Down", "Return")
     wait(lambda s: s["commands"].count("$I")>count, "Console history did not restore draft")
+    count=state()["commands"].count("M5")
+    command("type", "--clearmodifiers", "M5")  # Already focused: ordinary text input.
+    command("key", "Return")
+    wait(lambda s: s["commands"].count("M5")>count, "M shortcut interfered with console typing")
     click(752, 33)  # close the console
+    click(450, 400)
+    count=state()["commands"].count("M5")
+    command("key", "shift+m")
+    time.sleep(0.2)
+    command("type", "--clearmodifiers", "5")
+    command("key", "Return")
+    wait(lambda s: s["commands"].count("M5")>count, "M shortcut did not focus and prefill the console")
+    click(752, 33)
 
     def chooser():
         command("windowfocus", window)
@@ -190,7 +228,7 @@ try:
     time.sleep(0.6)
     start=state()
     previous=len(start["commands"])
-    click(100, 688)  # Trace hull at jog speed
+    click(100, 728)  # Trace hull at jog speed
     wait(lambda s: s["state"]=="Jog", "Hull trace did not start")
     screenshot("hull-trace.png")
     target=f"$J=G21G90X{start['x']:.3f}Y{start['y']:.3f}F600.0"
@@ -199,10 +237,10 @@ try:
                 "Hull trace did not close and return")
     assert not traced["torch"], "Hull trace lit the torch"
     time.sleep(0.3)
-    click(100, 688)
+    click(100, 728)
     wait(lambda s: s["state"]=="Jog", "Second hull trace did not start")
     time.sleep(0.15)
-    click(100, 688)  # Cancel hull trace
+    click(100, 728)  # Cancel hull trace
     wait(lambda s: s["state"]=="Idle", "Hull cancellation did not stop jogging")
     count=len(state()["commands"])
     time.sleep(0.4)
@@ -213,7 +251,7 @@ try:
     time.sleep(0.5)
     screenshot("small-display.png")
     assert process.poll() is None
-    print("GUI smoke checks passed: native picker/cancel/upload, icon, console/history, DRO, keyboard focus/release, Run/Pause/Resume/Stop, hull/return/cancel, resize")
+    print("GUI smoke checks passed: native picker/cancel/upload, icon, G/M console shortcuts/history/input focus, DRO, jog tap/hold/rapid/Shift/focus, Run/Pause/Resume/Stop, hull/return/cancel, resize")
     print("Screenshots:", ROOT / "dist")
 finally:
     if process.poll() is None:

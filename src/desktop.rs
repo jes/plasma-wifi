@@ -416,6 +416,8 @@ fn key(symbol: u32) -> Option<Key> {
             return match char::from_u32(symbol)?.to_ascii_uppercase() {
                 'A' => Some(Key::A),
                 'C' => Some(Key::C),
+                'G' => Some(Key::G),
+                'M' => Some(Key::M),
                 'O' => Some(Key::O),
                 'V' => Some(Key::V),
                 'X' => Some(Key::X),
