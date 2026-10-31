@@ -36,6 +36,7 @@ const STOP_FILL: Color32 = Color32::from_rgb(183, 29, 37);
 const COMMENT: Color32 = Color32::from_rgb(150, 157, 167);
 const LINE_NUMBER: Color32 = Color32::from_rgb(119, 130, 145);
 const CODE_FONT_SIZE: f32 = 14.0;
+const JOG_BUTTON_SIZE: f32 = 48.0;
 
 fn gcode_color(letter: char) -> Color32 {
     match letter.to_ascii_uppercase() {
@@ -1065,37 +1066,50 @@ impl App {
         ui.add_enabled_ui(
             self.snapshot.can_jog() && !self.snapshot.status.torch,
             |ui| {
-                egui::Grid::new("jog_pad")
-                    .spacing([5.0, 5.0])
-                    .show(ui, |ui| {
-                        for row in [
-                            [("", 0.0, 0.0), ("Y+", 0.0, 1.0), ("", 0.0, 0.0)],
-                            [("X−", -1.0, 0.0), ("", 0.0, 0.0), ("X+", 1.0, 0.0)],
-                            [("", 0.0, 0.0), ("Y−", 0.0, -1.0), ("", 0.0, 0.0)],
-                        ] {
-                            for (label, x, y) in row {
-                                if label.is_empty() {
-                                    ui.allocate_space(egui::vec2(100.0, 40.0));
-                                    continue;
+                ui.horizontal(|ui| {
+                    let pad_width = 3.0 * JOG_BUTTON_SIZE + 2.0 * 5.0;
+                    ui.add_space(((ui.available_width() - pad_width) / 2.0).max(0.0));
+                    egui::Grid::new("jog_pad")
+                        .spacing([5.0, 5.0])
+                        .show(ui, |ui| {
+                            for row in [
+                                [("", 0.0, 0.0), ("Y+", 0.0, 1.0), ("", 0.0, 0.0)],
+                                [("X−", -1.0, 0.0), ("", 0.0, 0.0), ("X+", 1.0, 0.0)],
+                                [("", 0.0, 0.0), ("Y−", 0.0, -1.0), ("", 0.0, 0.0)],
+                            ] {
+                                for (label, x, y) in row {
+                                    if label.is_empty() {
+                                        ui.allocate_space(Vec2::splat(JOG_BUTTON_SIZE));
+                                        continue;
+                                    }
+                                    let response = ui.add_sized(
+                                        Vec2::splat(JOG_BUTTON_SIZE),
+                                        egui::Button::new(RichText::new(label).strong()).fill(BLUE),
+                                    );
+                                    if response.is_pointer_button_down_on()
+                                        && response.contains_pointer()
+                                        || response.clicked()
+                                    {
+                                        let boosted = ui.input(|input| {
+                                            input.modifiers.shift
+                                                || input.events.iter().any(|event| {
+                                                    matches!(
+                                                        event,
+                                                        egui::Event::PointerButton {
+                                                            pressed: true,
+                                                            modifiers,
+                                                            ..
+                                                        } if modifiers.shift
+                                                    )
+                                                })
+                                        });
+                                        pointer_jog = Some((x, y, boosted));
+                                    }
                                 }
-                                let response = ui.add_sized(
-                                    [100.0, 40.0],
-                                    egui::Button::new(RichText::new(label).strong())
-                                        .fill(BLUE),
-                                );
-                                if response.is_pointer_button_down_on()
-                                    && response.contains_pointer()
-                                    || response.clicked()
-                                {
-                                    let boosted = ui.input(|input| input.modifiers.shift || input.events.iter().any(|event| {
-                                        matches!(event, egui::Event::PointerButton { pressed: true, modifiers, .. } if modifiers.shift)
-                                    }));
-                                    pointer_jog = Some((x, y, boosted));
-                                }
+                                ui.end_row();
                             }
-                            ui.end_row();
-                        }
-                    });
+                        });
+                });
             },
         );
         ui.ctx()

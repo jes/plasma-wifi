@@ -224,7 +224,7 @@ try:
 
     # Shift also changes speed during a held mouse jog, without pointer movement.
     baseline = len(state()["commands"])
-    command("mousemove", "--window", window, 270, 739, "mousedown", 1)
+    command("mousemove", "--window", window, 225, 751, "mousedown", 1)
     wait(lambda s: any(c.startswith("$J=") and c.endswith("F600.0") for c in s["commands"][baseline:]), "Held mouse jog did not start")
     baseline = len(state()["commands"])
     command("keydown", "Shift_L")
@@ -365,7 +365,7 @@ try:
     time.sleep(0.6)
     start=state()
     previous=len(start["commands"])
-    click(135, 900)  # Trace hull at jog speed
+    click(135, 924)  # Trace hull at jog speed
     wait(lambda s: s["state"]=="Jog", "Hull trace did not start")
     screenshot("hull-trace.png")
     target=f"$J=G21G90X{start['x']:.3f}Y{start['y']:.3f}F600.0"
@@ -374,7 +374,7 @@ try:
                 "Hull trace did not close and return")
     assert not traced["torch"], "Hull trace lit the torch"
     time.sleep(0.3)
-    click(135, 900)
+    click(135, 924)
     wait(lambda s: s["state"]=="Jog", "Second hull trace did not start")
     baseline = len(state()["commands"])
     command("keydown", "Shift_L")
@@ -384,7 +384,7 @@ try:
     command("keyup", "Shift_L")
     wait(lambda s: any(c.startswith("$J=") and c.endswith("F600.0") for c in s["commands"][baseline:]),
          "Releasing Shift did not slow the active hull trace")
-    click(135, 900)  # Cancel hull trace
+    click(135, 924)  # Cancel hull trace
     wait(lambda s: s["state"]=="Idle", "Hull cancellation did not stop jogging")
     count=len(state()["commands"])
     time.sleep(0.4)
