@@ -1301,6 +1301,54 @@ mod tests {
         assert_eq!(s.progress, 1.0);
     }
     #[test]
+    fn jog_speed_changes_resume_the_original_target_without_changing_job_override() {
+        let sim = Simulator::start().unwrap();
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
+        wait(&controller, |s| s.initialized && s.status.position_known);
+        controller.send(Action::Feed(0x91));
+        wait(&controller, |s| {
+            (s.status.feed_override - 1.1).abs() < 0.001
+        });
+        let start = controller.snapshot().status.wpos;
+        controller.send(Action::Jog {
+            x: 1.0,
+            y: 0.0,
+            speed: 600.0,
+            step: 100.0,
+        });
+        controller.send(Action::FinishJog);
+        wait(&controller, |s| s.status.state == "Jog");
+        let before = sim.commands().len();
+        controller.send(Action::JogSpeed { speed: 2400.0 });
+        wait(&controller, |_| {
+            sim.commands()[before..]
+                .iter()
+                .any(|cmd| cmd.starts_with("$J=") && cmd.ends_with("F2400.0"))
+        });
+        let before = sim.commands().len();
+        controller.send(Action::JogSpeed { speed: 600.0 });
+        wait(&controller, |_| {
+            sim.commands()[before..]
+                .iter()
+                .any(|cmd| cmd.starts_with("$J=") && cmd.ends_with("F600.0"))
+        });
+        let done = wait(&controller, |s| {
+            s.status.idle()
+                && !s.jog_restarting
+                && (s.status.wpos.x - start.x - 100.0).abs() < 0.001
+        });
+        assert!((done.status.feed_override - 1.1).abs() < 0.001);
+        assert!(!done.status.torch && done.alarm.is_none());
+        assert!(
+            done.console
+                .iter()
+                .filter(|s| s.contains("cancel jog"))
+                .count()
+                >= 2
+        );
+    }
+
+    #[test]
     fn hull_trace_is_closed_xy_only_torch_off_and_returns_to_start() {
         let sim = Simulator::start().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
@@ -1338,7 +1386,7 @@ mod tests {
             assert!(command.starts_with("$J=G21G90X") && command.ends_with("F777.0"));
             assert!(!command.contains('Z') && !command.contains("M3"));
         }
-        assert!(jogs.iter().any(|c| c.contains("X10.000Y10.000")));
+        assert!(jogs.iter().any(|c| c.contains("X10.00000Y10.00000")));
         assert!(!commands.iter().any(|c| c.starts_with("$LocalFS/Run=")));
         controller.send(Action::TraceHull { speed: 600.0 });
         wait(&controller, |s| s.tracing && s.status.state == "Jog");

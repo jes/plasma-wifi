@@ -116,6 +116,43 @@ fn highlight_gcode(source: &str) -> egui::text::LayoutJob {
     job
 }
 
+fn console_output(
+    ui: &mut egui::Ui,
+    snapshot: &Snapshot,
+    show_status: bool,
+) -> egui::scroll_area::ScrollAreaOutput<()> {
+    let lines = if show_status {
+        &snapshot.console
+    } else {
+        &snapshot.console_output
+    };
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
+    let columns = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    let width = columns as f32 * ui.fonts_mut(|fonts| fonts.glyph_width(&font, 'M'));
+    egui::ScrollArea::both()
+        .id_salt(("console_output", show_status))
+        .auto_shrink([false, false])
+        .max_height((ui.available_height() - 65.0).max(80.0))
+        .stick_to_bottom(true)
+        .show_rows(ui, row_height, lines.len(), |ui, rows| {
+            // Keep the horizontal extent stable when the longest line is
+            // outside the visible rows. Lines scroll horizontally, never wrap.
+            ui.set_min_width(width);
+            for row in rows {
+                ui.add(
+                    egui::Label::new(RichText::new(&lines[row]).monospace())
+                        .wrap_mode(egui::TextWrapMode::Extend)
+                        .selectable(true),
+                );
+            }
+        })
+}
+
 fn configure_style(ctx: &egui::Context) {
     ctx.global_style_mut(|style| {
         style.visuals = high_contrast_visuals();
@@ -752,6 +789,7 @@ impl App {
             && self.snapshot.status.position_known
             && !self.snapshot.transferring
             && !self.snapshot.tracing
+            && !self.snapshot.jog_restarting
     }
     fn resume_ready(&self) -> bool {
         self.snapshot.job
@@ -1138,6 +1176,7 @@ impl App {
             .add_enabled(
                 self.snapshot.can_jog()
                     && self.snapshot.status.idle()
+                    && !self.snapshot.jog_restarting
                     && self.snapshot.program.is_some()
                     && !self.snapshot.status.torch,
                 egui::Button::new("Trace hull at jog speed"),
@@ -1156,7 +1195,10 @@ impl App {
         (self.settings.jog_speed * if boosted { 4.0 } else { 1.0 }).min(3000.0)
     }
     fn jog_input(&mut self, ctx: &egui::Context) {
-        if self.snapshot.tracing || self.snapshot.status.state == "Jog" {
+        if self.snapshot.tracing
+            || self.snapshot.status.state == "Jog"
+            || self.snapshot.jog_restarting
+        {
             self.controller.send(Action::JogSpeed {
                 speed: self.jog_feed(ctx.input(|input| input.focused && input.modifiers.shift)),
             });
@@ -1684,18 +1726,7 @@ impl App {
             .default_size([760.0, 420.0])
             .show(ctx, |ui| {
                 ui.checkbox(&mut self.console_status, "Show status reports");
-                egui::ScrollArea::both()
-                    .id_salt("console_output")
-                    .max_height((ui.available_height() - 65.0).max(80.0))
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for line in &self.snapshot.console {
-                            if self.console_status || !line.starts_with('<') {
-                                let text = RichText::new(line).monospace();
-                                ui.add(egui::Label::new(text).selectable(true));
-                            }
-                        }
-                    });
+                console_output(ui, &self.snapshot, self.console_status);
                 ui.horizontal(|ui| {
                     let id = egui::Id::new("fluidnc_console_command");
                     self.console_input_id = Some(id);
@@ -1808,6 +1839,52 @@ fn duration(seconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_layout_stays_fixed_during_hidden_status_updates() {
+        let ctx = egui::Context::default();
+        configure_style(&ctx);
+        let mut snapshot = Snapshot {
+            console_output: Arc::new(
+                (0..200)
+                    .map(|i| format!("> {i}: {}", "G1X100Y200F600 ".repeat(12)))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let mut stable = None;
+        for frame in 0..40 {
+            Arc::make_mut(&mut snapshot.console).push_back(format!("<Run|MPos:{frame},0,0>"));
+            let mut geometry = None;
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(640.0, 480.0),
+                    )),
+                    time: Some(frame as f64 / 30.0),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show_inside(ui, |ui| {
+                        let scroll = console_output(ui, &snapshot, false);
+                        geometry =
+                            Some((scroll.inner_rect, scroll.content_size, scroll.state.offset));
+                    });
+                },
+            );
+            if frame >= 10 {
+                let geometry = geometry.unwrap();
+                assert!(geometry.1.x > 640.0, "Long lines must scroll horizontally");
+                if let Some((expected, shapes)) = &stable {
+                    assert_eq!(&geometry, expected);
+                    assert_eq!(&output.shapes, shapes);
+                } else {
+                    stable = Some((geometry, output.shapes));
+                }
+            }
+        }
+    }
 
     #[test]
     fn highlighting_keeps_values_with_words_and_comments_out_of_code() {

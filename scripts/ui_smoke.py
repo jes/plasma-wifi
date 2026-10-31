@@ -368,7 +368,7 @@ try:
     click(135, 924)  # Trace hull at jog speed
     wait(lambda s: s["state"]=="Jog", "Hull trace did not start")
     screenshot("hull-trace.png")
-    target=f"$J=G21G90X{start['x']:.3f}Y{start['y']:.3f}F600.0"
+    target=f"$J=G21G90X{start['x']:.5f}Y{start['y']:.5f}F600.0"
     traced=wait(lambda s: target in s["commands"][previous:] and s["state"]=="Idle"
                 and abs(s["x"]-start["x"])<0.001 and abs(s["y"]-start["y"])<0.001,
                 "Hull trace did not close and return")
