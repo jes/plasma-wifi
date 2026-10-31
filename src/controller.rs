@@ -27,6 +27,7 @@ pub enum Action {
     Stop,
     Unlock,
     Console(String),
+    WifiScanMessage(String),
     ListFiles,
     UploadFile {
         path: PathBuf,
@@ -294,6 +295,7 @@ pub struct Controller {
     tx: Option<Sender<Action>>,
     shared: Arc<Mutex<Snapshot>>,
     handle: Option<thread::JoinHandle<()>>,
+    wifi_rescan: Option<crate::wifi::Rescan>,
 }
 impl Controller {
     pub fn start(address: String, http: String, coordinates_path: Option<PathBuf>) -> Self {
@@ -314,7 +316,21 @@ impl Controller {
             tx: Some(tx),
             shared,
             handle: Some(handle),
+            wifi_rescan: None,
         }
+    }
+    pub fn enable_wifi_rescans(&mut self) {
+        if self.wifi_rescan.is_some() {
+            return;
+        }
+        let state = self.shared.clone();
+        let tx = self.tx.as_ref().unwrap().clone();
+        self.wifi_rescan = Some(crate::wifi::Rescan::start(
+            move || !state.lock().unwrap().connected,
+            move |message| {
+                let _ = tx.send(Action::WifiScanMessage(message));
+            },
+        ));
     }
     pub fn send(&self, action: Action) {
         if let Some(tx) = &self.tx {
@@ -327,6 +343,8 @@ impl Controller {
 }
 impl Drop for Controller {
     fn drop(&mut self) {
+        // The WiFi helper owns an action sender; stop it before closing the queue.
+        drop(self.wifi_rescan.take());
         if let Some(tx) = self.tx.take() {
             let _ = tx.send(Action::CancelJog);
             drop(tx);
@@ -1164,6 +1182,7 @@ impl Worker {
     }
     fn action(&mut self, action: Action) -> Result<()> {
         match action {
+            Action::WifiScanMessage(message) => self.s.log(message),
             action @ (Action::ListFiles
             | Action::UploadFile { .. }
             | Action::DownloadFile { .. }) => {

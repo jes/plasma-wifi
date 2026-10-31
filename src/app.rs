@@ -406,12 +406,16 @@ impl App {
         } else {
             13.0
         };
+        let mut controller = Controller::start(
+            settings.address.clone(),
+            settings.http.clone(),
+            (!demo).then(crate::coordinates::Coordinates::path),
+        );
+        if !demo {
+            controller.enable_wifi_rescans();
+        }
         Self {
-            controller: Controller::start(
-                settings.address.clone(),
-                settings.http.clone(),
-                (!demo).then(crate::coordinates::Coordinates::path),
-            ),
+            controller,
             snapshot: Snapshot::default(),
             settings,
             dro: ["0.000".into(), "0.000".into()],
