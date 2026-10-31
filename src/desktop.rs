@@ -14,6 +14,13 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
+pub fn set_ui_scale(ctx: &egui::Context, scale: f32) {
+    // egui applies the zoom on the next pass. The backend needs that same
+    // pending scale when translating physical pointer coordinates to points.
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("ui_scale"), scale));
+    ctx.set_zoom_factor(scale);
+}
+
 pub fn run(mut draw: impl FnMut(&mut egui::Ui)) -> Result<()> {
     let (conn, screen_id) = x11rb::connect(None)
         .context("Cannot connect to X11. Run from an X11 desktop or enable XWayland.")?;
@@ -40,7 +47,10 @@ pub fn run(mut draw: impl FnMut(&mut egui::Ui)) -> Result<()> {
     );
     let window = conn.generate_id()?;
     let gc = conn.generate_id()?;
-    let (mut width, mut height) = (1180u16, 800u16);
+    let (mut width, mut height) = (
+        1180u16.min(screen.width_in_pixels),
+        1000u16.min(screen.height_in_pixels.saturating_sub(70)),
+    );
     conn.create_window(
         COPY_DEPTH_FROM_PARENT,
         window,
@@ -119,18 +129,25 @@ pub fn run(mut draw: impl FnMut(&mut egui::Ui)) -> Result<()> {
     let mut pixels = Vec::<[u8; 4]>::new();
     let mut clipboard_text = String::new();
     let mut focused = true;
+    let mut current_modifiers = Modifiers::NONE;
+    let mut pointer_position: Option<Pos2> = None;
     let mut pressed = HashSet::new();
+    let mut last_key_release = None;
     let start = Instant::now();
     let mut quit = false;
     while !quit {
         let frame_start = Instant::now();
+        let pixels_per_point = ctx
+            .data(|data| data.get_temp::<f32>(egui::Id::new("ui_scale")))
+            .unwrap_or(1.0);
         let mut input = RawInput {
             screen_rect: Some(Rect::from_min_size(
                 Pos2::ZERO,
-                Vec2::new(width as f32, height as f32),
+                Vec2::new(width as f32, height as f32) / pixels_per_point,
             )),
             time: Some(start.elapsed().as_secs_f64()),
             focused,
+            modifiers: current_modifiers,
             ..Default::default()
         };
         while let Some(event) = conn.poll_for_event()? {
@@ -153,6 +170,7 @@ pub fn run(mut draw: impl FnMut(&mut egui::Ui)) -> Result<()> {
                 }
                 Event::FocusOut(_) => {
                     focused = false;
+                    input.modifiers = Modifiers::NONE;
                     for key in pressed.drain() {
                         input.events.push(InputEvent::Key {
                             key,
@@ -165,13 +183,18 @@ pub fn run(mut draw: impl FnMut(&mut egui::Ui)) -> Result<()> {
                     input.events.push(InputEvent::WindowFocused(false));
                 }
                 Event::MotionNotify(e) => {
-                    let pointer = Pos2::new(e.event_x as f32, e.event_y as f32);
+                    pointer_position = Some(Pos2::new(e.event_x as f32, e.event_y as f32));
+                    let pointer = pointer_position.unwrap() / pixels_per_point;
                     input.events.push(InputEvent::PointerMoved(pointer));
                 }
-                Event::LeaveNotify(_) => input.events.push(InputEvent::PointerGone),
+                Event::LeaveNotify(_) => {
+                    pointer_position = None;
+                    input.events.push(InputEvent::PointerGone);
+                }
                 Event::ButtonPress(e) | Event::ButtonRelease(e) => {
                     let down = e.response_type & 0x7f == BUTTON_PRESS_EVENT;
-                    let pointer = Pos2::new(e.event_x as f32, e.event_y as f32);
+                    pointer_position = Some(Pos2::new(e.event_x as f32, e.event_y as f32));
+                    let pointer = pointer_position.unwrap() / pixels_per_point;
                     let mods = modifiers(e.state);
                     input.modifiers = mods;
                     if (4..=7).contains(&e.detail) && down {
@@ -203,18 +226,35 @@ pub fn run(mut draw: impl FnMut(&mut egui::Ui)) -> Result<()> {
                 }
                 Event::KeyPress(e) | Event::KeyRelease(e) => {
                     let down = e.response_type & 0x7f == KEY_PRESS_EVENT;
-                    let mods = modifiers(e.state);
-                    input.modifiers = mods;
+                    let mut mods = modifiers(e.state);
                     let offset = (e.detail.saturating_sub(setup.min_keycode) as usize)
                         * mapping.keysyms_per_keycode as usize;
                     let base = *mapping.keysyms.get(offset).unwrap_or(&0);
+                    // X11 reports modifier state before this event. Update Shift
+                    // immediately so it also changes speed during a held mouse jog.
+                    match base {
+                        0xffe1 | 0xffe2 => mods.shift = down,
+                        0xffe3 | 0xffe4 => {
+                            mods.ctrl = down;
+                            mods.command = down;
+                        }
+                        0xffe9 | 0xffea => mods.alt = down,
+                        _ => {}
+                    }
+                    input.modifiers = mods;
                     let shifted = *mapping.keysyms.get(offset + 1).unwrap_or(&0);
                     let upper = mods.shift ^ e.state.contains(KeyButMask::LOCK);
                     let symbol = if upper && shifted != 0 { shifted } else { base };
                     if let Some(key) = key(base) {
                         let repeat = if down {
-                            !pressed.insert(key)
+                            // Traditional X11 autorepeat sends a release/press
+                            // pair with the same timestamp. Detect that pair as
+                            // well as servers that emit repeated presses alone.
+                            let paired_repeat = last_key_release == Some((e.detail, e.time));
+                            last_key_release = None;
+                            !pressed.insert(key) || paired_repeat
                         } else {
+                            last_key_release = Some((e.detail, e.time));
                             pressed.remove(&key);
                             false
                         };
@@ -230,7 +270,16 @@ pub fn run(mut draw: impl FnMut(&mut egui::Ui)) -> Result<()> {
                             input.events.push(InputEvent::Copy);
                         } else if down && mods.ctrl && key == Key::X {
                             input.events.push(InputEvent::Cut);
-                        } else {
+                        } else if !(down
+                            && repeat
+                            && matches!(key, Key::R | Key::P | Key::S)
+                            && !mods.ctrl
+                            && !mods.alt)
+                        {
+                            // egui recalculates repeat from its key state, so a
+                            // synthetic release/press pair looks like a new press.
+                            // Omit repeated transport key events before that step.
+                            // Text events below still repeat normally in inputs.
                             input.events.push(InputEvent::Key {
                                 key,
                                 physical_key: Some(key),
@@ -300,9 +349,21 @@ pub fn run(mut draw: impl FnMut(&mut egui::Ui)) -> Result<()> {
             }
         }
         input.focused = focused && !quit;
+        current_modifiers = input.modifiers;
+        // Zoom can change while the physical mouse is stationary.
+        if let Some(pointer) = pointer_position {
+            input
+                .events
+                .push(InputEvent::PointerMoved(pointer / pixels_per_point));
+        }
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .native_pixels_per_point = Some(1.0);
         input.screen_rect = Some(Rect::from_min_size(
             Pos2::ZERO,
-            Vec2::new(width as f32, height as f32),
+            Vec2::new(width as f32, height as f32) / pixels_per_point,
         ));
         let output = ctx.run_ui(input, |ui| draw(ui));
         for command in output.platform_output.commands {
@@ -416,9 +477,14 @@ fn key(symbol: u32) -> Option<Key> {
             return match char::from_u32(symbol)?.to_ascii_uppercase() {
                 'A' => Some(Key::A),
                 'C' => Some(Key::C),
+                'F' => Some(Key::F),
                 'G' => Some(Key::G),
+                'I' => Some(Key::I),
                 'M' => Some(Key::M),
                 'O' => Some(Key::O),
+                'P' => Some(Key::P),
+                'R' => Some(Key::R),
+                'S' => Some(Key::S),
                 'V' => Some(Key::V),
                 'X' => Some(Key::X),
                 'Y' => Some(Key::Y),

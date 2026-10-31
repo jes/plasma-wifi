@@ -3,7 +3,7 @@ use crate::{
     gcode::{self, ParseOptions, Point, Program, TimeParts},
     protocol::{self, Link, Status},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::{
     collections::VecDeque,
     path::PathBuf,
@@ -27,7 +27,18 @@ pub enum Action {
     Stop,
     Unlock,
     Console(String),
+    ListFiles,
+    UploadFile {
+        path: PathBuf,
+    },
+    DownloadFile {
+        name: String,
+        path: PathBuf,
+    },
     TraceHull {
+        speed: f64,
+    },
+    JogSpeed {
         speed: f64,
     },
     CancelTrace,
@@ -61,6 +72,8 @@ pub struct Snapshot {
     pub program: Option<Arc<Program>>,
     pub upload: String,
     pub free: Option<String>,
+    pub files: Vec<protocol::RemoteFile>,
+    pub files_message: String,
     pub error: Option<String>,
     pub log: VecDeque<String>,
     pub console: VecDeque<String>,
@@ -77,6 +90,9 @@ pub struct Snapshot {
     pub options: ParseOptions,
     pub line_numbers: bool,
     pub version: String,
+    pub acceleration: [Option<f64>; 2],
+    pub planner_blocks: Option<usize>,
+    pub modal: String,
 }
 impl Default for Snapshot {
     fn default() -> Self {
@@ -90,6 +106,8 @@ impl Default for Snapshot {
             program: None,
             upload: "Open a G-code file to begin".into(),
             free: None,
+            files: Vec::new(),
+            files_message: String::new(),
             error: None,
             log: VecDeque::new(),
             console: VecDeque::new(),
@@ -106,10 +124,22 @@ impl Default for Snapshot {
             options: ParseOptions::default(),
             line_numbers: false,
             version: String::new(),
+            acceleration: [None; 2],
+            planner_blocks: None,
+            modal: String::new(),
         }
     }
 }
 impl Snapshot {
+    pub fn can_manage_files(&self) -> bool {
+        self.connected
+            && self.status.fresh()
+            && (self.status.idle() || self.status.state == "Alarm")
+            && !self.status.torch
+            && !self.job
+            && !self.tracing
+            && !self.transferring
+    }
     pub fn can_run(&self) -> bool {
         self.connected
             && self.initialized
@@ -126,6 +156,8 @@ impl Snapshot {
     pub fn can_jog(&self) -> bool {
         self.connected
             && self.initialized
+            && self.acceleration.iter().all(Option::is_some)
+            && self.planner_blocks.is_some()
             && self.status.fresh()
             && self.status.position_known
             && self.status.wco_known
@@ -133,6 +165,52 @@ impl Snapshot {
             && !self.transferring
             && !self.tracing
             && (self.status.idle() || self.status.state == "Jog")
+    }
+    fn jog_lookahead(
+        &self,
+        direction: Point,
+        speed: f64,
+        previous: f64,
+        ack_delay: f64,
+    ) -> Option<JogLookahead> {
+        let length = direction.x.hypot(direction.y);
+        if length < 1e-12 {
+            return None;
+        }
+        let mut acceleration = f64::INFINITY;
+        let mut velocity = speed.max(previous).max(self.status.feed) / 60.0;
+        for (component, acceleration_limit, rate) in [
+            (
+                direction.x.abs() / length,
+                self.acceleration[0]?,
+                self.options.rapid.x,
+            ),
+            (
+                direction.y.abs() / length,
+                self.acceleration[1]?,
+                self.options.rapid.y,
+            ),
+        ] {
+            if component > 1e-12 {
+                acceleration = acceleration.min(acceleration_limit / component);
+                velocity = velocity.min(rate / 60.0 / component);
+            }
+        }
+        let report_age = self.status.at.map_or(0.0, |at| at.elapsed().as_secs_f64());
+        // Keep the stopping distance available even while a report and a pair
+        // of command round trips are in flight. Acks include planner backpressure.
+        let refill = velocity * velocity / (2.0 * acceleration)
+            + velocity * (0.15 + report_age + 2.0 * ack_delay.max(0.01));
+        // Reserve slots for the active block, the next packet and an ack in
+        // flight. Slow acceleration must enlarge packets, not fill all slots
+        // with too little physical distance to reach the requested velocity.
+        // An increment boundary can add a shorter block between full packets.
+        let packets = self.planner_blocks?.saturating_sub(4).max(2) as f64 / 2.0;
+        let segment = (velocity * 0.1)
+            .max(velocity * (2.0 * ack_delay + 0.02))
+            .max(refill / packets)
+            .max(0.001);
+        (refill.is_finite() && segment.is_finite()).then_some(JogLookahead { refill, segment })
     }
     fn log(&mut self, text: impl Into<String>) {
         self.log.push_back(text.into());
@@ -188,14 +266,24 @@ struct Trace {
     next: usize,
     sent: Option<Instant>,
     speed: f64,
+    active_speed: f64,
+    cursor: Point,
+}
+
+struct JogLookahead {
+    refill: f64,
+    segment: f64,
 }
 
 struct ManualJog {
     x: f64,
     y: f64,
     speed: f64,
+    active_speed: f64,
+    cursor: Point,
     step: f64,
     target: Point,
+    origin: Point,
     heartbeat: Instant,
     extended: Instant,
     sent: bool,
@@ -322,6 +410,20 @@ impl Tracker {
 enum Transfer {
     Message(String),
     Done(Result<protocol::FileInfo>),
+    FilesMessage(String),
+    FilesDone(Result<FilesResult>),
+}
+enum FilesResult {
+    Listed(Vec<protocol::RemoteFile>),
+    Uploaded {
+        name: String,
+        info: protocol::FileInfo,
+    },
+    Downloaded {
+        name: String,
+        path: PathBuf,
+        bytes: usize,
+    },
 }
 #[derive(Clone, Copy, Debug)]
 enum CoordinateRecovery {
@@ -366,6 +468,7 @@ struct Worker {
     coordinates: Coordinates,
     coordinate_recovery: CoordinateRecovery,
     checkpoint_error: bool,
+    jog_ack_delay: f64,
 }
 impl Worker {
     fn new(
@@ -414,6 +517,7 @@ impl Worker {
             coordinates: Coordinates::default(),
             coordinate_recovery: CoordinateRecovery::Pending,
             checkpoint_error: false,
+            jog_ack_delay: 0.01,
         }
     }
     fn run(mut self) {
@@ -466,7 +570,11 @@ impl Worker {
                         self.s.connected = true;
                         self.s.status = Status::default();
                         self.s.status.state = "Connecting".into();
+                        self.s.modal.clear();
                         self.s.initialized = false;
+                        self.s.acceleration = [None; 2];
+                        self.s.planner_blocks = None;
+                        self.jog_ack_delay = 0.01;
                         self.got_units = false;
                         self.init_started = false;
                         self.selected_work_system = false;
@@ -538,6 +646,7 @@ impl Worker {
         self.s.status.state = "Disconnected".into();
         self.s.phase = "Reconnecting…".into();
         self.s.log(message);
+        self.s.files.clear();
         self.queue.clear();
         self.pending = None;
         self.jog = None;
@@ -582,7 +691,15 @@ impl Worker {
         let Some(link) = &mut self.link else {
             return Ok(());
         };
-        if self.poll.elapsed() > Duration::from_millis(if self.auto_reports { 1000 } else { 100 }) {
+        let establishing_position =
+            !self.s.initialized || !self.s.status.position_known || !self.s.status.wco_known;
+        if self.poll.elapsed()
+            > Duration::from_millis(if self.auto_reports && !establishing_position {
+                1000
+            } else {
+                100
+            })
+        {
             link.send(b"?")?;
             self.poll = Instant::now();
         }
@@ -857,10 +974,14 @@ impl Worker {
             self.pending = None;
             self.s.initialized = false;
             self.init_started = false;
+            self.s.acceleration = [None; 2];
+            self.s.planner_blocks = None;
+            self.jog_ack_delay = 0.01;
             self.selected_work_system = false;
             self.coordinate_recovery = CoordinateRecovery::Pending;
             self.s.status = Status::default();
             self.s.status.state = "Connecting".into();
+            self.s.modal.clear();
             self.got_units = false;
             self.auto_reports = false;
             self.queue.push_back("$report_inches".into());
@@ -883,6 +1004,28 @@ impl Worker {
             self.s.line_numbers = value.trim() == "true";
         }
         for (axis, key) in [
+            "$/axes/x/acceleration_mm_per_sec2=",
+            "$/axes/y/acceleration_mm_per_sec2=",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(value) = line
+                .strip_prefix(key)
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+            {
+                self.s.acceleration[axis] = Some(value);
+            }
+        }
+        if let Some(blocks) = line
+            .strip_prefix("$/planner_blocks=")
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| (10..=120).contains(v))
+        {
+            self.s.planner_blocks = Some(blocks);
+        }
+        for (axis, key) in [
             ('x', "$/axes/x/max_rate_mm_per_min="),
             ('y', "$/axes/y/max_rate_mm_per_min="),
             ('z', "$/axes/z/max_rate_mm_per_min="),
@@ -890,7 +1033,7 @@ impl Worker {
             if let Some(v) = line
                 .strip_prefix(key)
                 .and_then(|v| v.parse::<f64>().ok())
-                .filter(|v| *v > 0.0)
+                .filter(|v| v.is_finite() && *v > 0.0)
             {
                 match axis {
                     'x' => self.s.options.rapid.x = v,
@@ -900,6 +1043,7 @@ impl Worker {
             }
         }
         if let Some(modal) = line.strip_prefix("[GC:").and_then(|s| s.strip_suffix(']')) {
+            self.s.modal = modal.into();
             for word in modal.split_whitespace() {
                 match word {
                     "G20" => self.s.options.initial_mm = false,
@@ -930,8 +1074,11 @@ impl Worker {
                 .unwrap_or(0.0);
         }
         if (line == "ok" || line.starts_with("error:"))
-            && let Some((cmd, _)) = self.pending.take()
+            && let Some((cmd, sent)) = self.pending.take()
         {
+            if cmd.starts_with("$J=") && line == "ok" {
+                self.jog_ack_delay = (self.jog_ack_delay * 0.9).max(sent.elapsed().as_secs_f64());
+            }
             if line.starts_with("error:") {
                 self.fail(format!("{cmd}: {line}"));
                 if matches!(self.coordinate_recovery, CoordinateRecovery::Writing)
@@ -978,6 +1125,9 @@ impl Worker {
                     "$axes/x/max_rate_mm_per_min",
                     "$axes/y/max_rate_mm_per_min",
                     "$axes/z/max_rate_mm_per_min",
+                    "$axes/x/acceleration_mm_per_sec2",
+                    "$axes/y/acceleration_mm_per_sec2",
+                    "$planner_blocks",
                 ] {
                     self.queue.push_back(cmd.into());
                 }
@@ -1014,6 +1164,77 @@ impl Worker {
     }
     fn action(&mut self, action: Action) -> Result<()> {
         match action {
+            action @ (Action::ListFiles
+            | Action::UploadFile { .. }
+            | Action::DownloadFile { .. }) => {
+                ensure!(
+                    self.s.can_manage_files(),
+                    "File transfers require an idle controller or Alarm, with the torch off"
+                );
+                ensure!(
+                    self.jog.is_none()
+                        && self.pending.is_none()
+                        && self.queue.is_empty()
+                        && self.stopping.is_none()
+                        && self.reset_wait.is_none(),
+                    "Wait for the current controller command to finish"
+                );
+                if let Action::UploadFile { path } = &action {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .context("Invalid local filename")?;
+                    protocol::validate_filename(name)?;
+                    if name == "plasma.nc" {
+                        // An arbitrary replacement is not the verified, processed job.
+                        self.s.ready = false;
+                        self.need_upload = false;
+                        self.need_verify = false;
+                        self.failed_transfer = true;
+                        self.s.upload =
+                            "plasma.nc replaced through Files; reopen G-code before Run".into();
+                    }
+                }
+                if let Action::DownloadFile { name, .. } = &action {
+                    protocol::validate_filename(name)?;
+                }
+                let base = self.http.clone();
+                let (tx, rx) = mpsc::channel();
+                self.transfer = Some(rx);
+                self.s.transferring = true;
+                if self.s.error.as_deref() == Some(self.s.files_message.as_str()) {
+                    self.s.error = None;
+                }
+                self.s.files_message = "Transferring controller files…".into();
+                thread::spawn(move || {
+                    let result = (|| -> Result<FilesResult> {
+                        match action {
+                            Action::ListFiles => {
+                                Ok(FilesResult::Listed(protocol::list_files(&base)?))
+                            }
+                            Action::UploadFile { path } => {
+                                let name = path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap()
+                                    .to_owned();
+                                let data = std::fs::read(&path)
+                                    .with_context(|| format!("Read {}", path.display()))?;
+                                let info = protocol::upload_file(&base, &name, &data, |message| {
+                                    let _ = tx.send(Transfer::FilesMessage(message.into()));
+                                })?;
+                                Ok(FilesResult::Uploaded { name, info })
+                            }
+                            Action::DownloadFile { name, path } => {
+                                let bytes = protocol::download_file(&base, &name, &path)?;
+                                Ok(FilesResult::Downloaded { name, path, bytes })
+                            }
+                            _ => unreachable!(),
+                        }
+                    })();
+                    let _ = tx.send(Transfer::FilesDone(result));
+                });
+            }
             Action::Load { name, text } => {
                 ensure!(
                     !self.s.job && !self.s.tracing && self.transfer.is_none(),
@@ -1171,8 +1392,9 @@ impl Worker {
                 let length = x.hypot(y);
                 let (x, y) = (x / length, y / length);
                 if let Some(jog) = &mut self.jog
-                    && (jog.x, jog.y, jog.speed, jog.step) == (x, y, speed, step)
+                    && (jog.x, jog.y, jog.step) == (x, y, step)
                 {
+                    jog.speed = speed;
                     jog.heartbeat = Instant::now();
                     return Ok(());
                 }
@@ -1183,12 +1405,15 @@ impl Worker {
                     x,
                     y,
                     speed,
+                    active_speed: speed,
+                    cursor: self.s.status.wpos,
                     step,
                     target: Point {
                         x: self.s.status.wpos.x + x * step,
                         y: self.s.status.wpos.y + y * step,
                         z: self.s.status.wpos.z,
                     },
+                    origin: self.s.status.wpos,
                     heartbeat: Instant::now(),
                     extended: Instant::now(),
                     sent: false,
@@ -1200,8 +1425,18 @@ impl Worker {
                 // A normal release completes the selected increment, including a
                 // short tap. Focus loss, Stop and heartbeat expiry cancel instead.
                 if let Some(jog) = &mut self.jog {
+                    // Finish only the increment boundary needed by motion
+                    // already sent, rather than an unsent lookahead target.
+                    let sent_distance = (jog.cursor.x - jog.origin.x) * jog.x
+                        + (jog.cursor.y - jog.origin.y) * jog.y;
+                    let distance = ((sent_distance / jog.step - 1e-9).ceil().max(1.0)) * jog.step;
+                    jog.target = Point {
+                        x: jog.origin.x + jog.x * distance,
+                        y: jog.origin.y + jog.y * distance,
+                        z: jog.origin.z,
+                    };
                     jog.released = true;
-                    if jog.sent {
+                    if jog.sent && jog.cursor.distance(jog.target) < 1e-9 {
                         self.jog = None;
                     }
                 }
@@ -1300,6 +1535,18 @@ impl Worker {
                     }
                 }
             }
+            Action::JogSpeed { speed } => {
+                ensure!(
+                    speed.is_finite() && (1.0..=3000.0).contains(&speed),
+                    "Invalid trace speed"
+                );
+                if let Some(trace) = &mut self.trace {
+                    trace.speed = speed;
+                }
+                if let Some(jog) = &mut self.jog {
+                    jog.speed = speed;
+                }
+            }
             Action::TraceHull { speed } => {
                 ensure!(
                     self.s.can_jog()
@@ -1354,6 +1601,8 @@ impl Worker {
                     next: 0,
                     sent: None,
                     speed,
+                    active_speed: speed,
+                    cursor: Point { z: 0.0, ..start },
                 });
             }
             Action::CancelTrace => {
@@ -1422,7 +1671,7 @@ impl Worker {
         let Some(jog) = &mut self.jog else {
             return Ok(());
         };
-        if jog.heartbeat.elapsed() > Duration::from_millis(250)
+        if !jog.released && jog.heartbeat.elapsed() > Duration::from_millis(250)
             || !self.s.can_jog()
             || self.s.status.torch
         {
@@ -1432,37 +1681,63 @@ impl Worker {
         if self.pending.is_some() || !self.queue.is_empty() {
             return Ok(());
         }
-        if jog.sent {
-            if jog.extended.elapsed() < Duration::from_millis(100)
-                // Keep only a small distance ahead of reported motion. A slow
-                // controller must not accumulate a growing queue of increments.
-                || jog.target.distance(self.s.status.wpos) > jog.speed / 600.0 + 0.001
-            {
-                return Ok(());
-            }
-            let distance = (jog.speed / 600.0 / jog.step).ceil().max(1.0) * jog.step;
+        let lookahead = self
+            .s
+            .jog_lookahead(
+                Point {
+                    x: jog.x,
+                    y: jog.y,
+                    z: 0.0,
+                },
+                jog.speed,
+                jog.active_speed,
+                self.jog_ack_delay,
+            )
+            .context("Controller acceleration or planner capacity unavailable for jogging")?;
+        if !jog.released
+            && jog.extended.elapsed() >= Duration::from_millis(100)
+            && jog.target.distance(self.s.status.wpos) <= lookahead.refill + 0.001
+        {
+            let needed = (lookahead.refill + lookahead.segment
+                - jog.target.distance(self.s.status.wpos))
+            .max(lookahead.segment);
+            let distance = (needed / jog.step).ceil().max(1.0) * jog.step;
             jog.target.x += jog.x * distance;
             jog.target.y += jog.y * distance;
+            jog.extended = Instant::now();
         }
+        let remaining = jog.cursor.distance(jog.target);
+        if remaining < 1e-9 {
+            if jog.released {
+                self.jog = None;
+            }
+            return Ok(());
+        }
+        // Keep enough physical distance ahead for braking and communication,
+        // without using up the planner's capacity with packets that are too short.
+        if jog.sent && jog.cursor.distance(self.s.status.wpos) > lookahead.refill + 0.001 {
+            return Ok(());
+        }
+        let point = jog
+            .cursor
+            .lerp(jog.target, (lookahead.segment / remaining).min(1.0));
         let command = if jog.sent {
-            format!(
-                "$J=G21G90X{:.5}Y{:.5}F{:.1}",
-                jog.target.x, jog.target.y, jog.speed
-            )
+            format!("$J=G21G90X{:.5}Y{:.5}F{:.1}", point.x, point.y, jog.speed)
         } else {
-            // Each tap is relative so consecutive taps still move one increment
-            // each when they arrive faster than position feedback.
+            // Relative first segments preserve separate taps received before
+            // position feedback; subsequent segments use absolute targets.
             format!(
                 "$J=G21G91X{:.5}Y{:.5}F{:.1}",
-                jog.x * jog.step,
-                jog.y * jog.step,
+                point.x - jog.cursor.x,
+                point.y - jog.cursor.y,
                 jog.speed
             )
         };
         self.queue.push_back(command.into());
+        jog.cursor = point;
         jog.sent = true;
-        jog.extended = Instant::now();
-        if jog.released {
+        jog.active_speed = jog.speed;
+        if jog.released && jog.cursor.distance(jog.target) < 1e-9 {
             self.jog = None;
         }
         Ok(())
@@ -1529,11 +1804,13 @@ impl Worker {
             return Ok(());
         }
         let trace = self.trace.as_mut().unwrap();
-        if let Some(sent) = trace.sent {
-            let current = Point {
-                z: 0.0,
-                ..self.s.status.wpos
-            };
+        let current = Point {
+            z: 0.0,
+            ..self.s.status.wpos
+        };
+        if let Some(sent) = trace.sent
+            && trace.cursor.distance(trace.points[trace.next]) < 1e-9
+        {
             if !self.s.status.idle()
                 || self.s.status.at.is_none_or(|at| at <= sent)
                 || current.distance(trace.points[trace.next]) > 0.01
@@ -1542,6 +1819,13 @@ impl Worker {
             }
             trace.next += 1;
             trace.sent = None;
+            trace.active_speed = trace.speed;
+        }
+        while trace.sent.is_none()
+            && trace.next < trace.points.len()
+            && trace.cursor.distance(trace.points[trace.next]) < 1e-9
+        {
+            trace.next += 1;
         }
         if trace.next == trace.points.len() {
             self.trace = None;
@@ -1551,11 +1835,33 @@ impl Worker {
                 .log("Hull trace complete; returned to starting position");
             return Ok(());
         }
-        let point = trace.points[trace.next];
+        let target = trace.points[trace.next];
+        let remaining = trace.cursor.distance(target);
+        let lookahead = self
+            .s
+            .jog_lookahead(
+                Point {
+                    x: target.x - trace.cursor.x,
+                    y: target.y - trace.cursor.y,
+                    z: 0.0,
+                },
+                trace.speed,
+                trace.active_speed,
+                self.jog_ack_delay,
+            )
+            .context("Controller acceleration or planner capacity unavailable for hull tracing")?;
+        if trace.sent.is_some() && trace.cursor.distance(current) > lookahead.refill + 0.001 {
+            return Ok(());
+        }
+        let point = trace
+            .cursor
+            .lerp(target, (lookahead.segment / remaining).min(1.0));
         self.queue.push_back(
             format!("$J=G21G90X{:.3}Y{:.3}F{:.1}", point.x, point.y, trace.speed).into(),
         );
+        trace.cursor = point;
         trace.sent = Some(Instant::now());
+        trace.active_speed = trace.speed;
         self.s.phase = format!("Tracing hull · {}/{}", trace.next + 1, trace.points.len());
         Ok(())
     }
@@ -1592,6 +1898,43 @@ impl Worker {
             let events: Vec<_> = rx.try_iter().collect();
             for event in events {
                 match event {
+                    Transfer::FilesMessage(message) => self.s.files_message = message,
+                    Transfer::FilesDone(result) => {
+                        self.transfer = None;
+                        self.s.transferring = false;
+                        match result {
+                            Ok(FilesResult::Listed(files)) => {
+                                self.s.files_message =
+                                    format!("{} files on controller", files.len());
+                                self.s.files = files;
+                            }
+                            Ok(FilesResult::Uploaded { name, info }) => {
+                                self.s.files.retain(|file| file.name != name);
+                                self.s.files.push(protocol::RemoteFile {
+                                    name: name.clone(),
+                                    bytes: info.bytes,
+                                });
+                                self.s.files.sort_by(|a, b| a.name.cmp(&b.name));
+                                self.s.free = info.free;
+                                self.s.files_message = format!(
+                                    "Uploaded {name} · {} bytes · contents verified",
+                                    info.bytes
+                                );
+                                self.s.log(self.s.files_message.clone());
+                            }
+                            Ok(FilesResult::Downloaded { name, path, bytes }) => {
+                                self.s.files_message = format!(
+                                    "Downloaded {name} · {bytes} bytes → {}",
+                                    path.display()
+                                );
+                                self.s.log(self.s.files_message.clone());
+                            }
+                            Err(error) => {
+                                self.s.files_message = format!("File transfer failed: {error:#}");
+                                self.fail(self.s.files_message.clone());
+                            }
+                        }
+                    }
                     Transfer::Message(message) => self.s.upload = message,
                     Transfer::Done(result) => {
                         self.transfer = None;
@@ -1684,12 +2027,207 @@ mod tests {
         worker.link = Some(Link::connect(&sim.address).unwrap());
         worker.s.connected = true;
         worker.s.initialized = true;
+        worker.s.acceleration = [Some(100.0); 2];
+        worker.s.planner_blocks = Some(16);
         worker.got_units = true;
         worker
             .s
             .status
             .update("<Idle|MPos:10,20,0|WCO:0,0,0|Ov:100,100,100>", false);
         (sim, worker)
+    }
+
+    // A separate, deterministic 1D planner model: it accelerates at the configured
+    // rate, assumes a stop at the last received endpoint, has finite planner slots,
+    // and delays both command acknowledgements and position reports. Unlike the
+    // loopback simulator, it does not teleport to commanded targets.
+    fn check_sustained_speed(trace: bool, acceleration: f64, blocks: usize, one_way: f64) {
+        let (_sim, mut worker) = connected_worker();
+        worker
+            .s
+            .status
+            .update("<Idle|MPos:0,0,0|WCO:0,0,0|Ov:100,100,100>", false);
+        worker.s.acceleration = [Some(acceleration); 2];
+        worker.s.planner_blocks = Some(blocks);
+        if trace {
+            worker.s.program = Some(Arc::new(
+                gcode::parse("G21G90\nG0X10000Y0\nG1Y100F3000\nX0\nY0", worker.s.options).unwrap(),
+            ));
+            worker.action(Action::TraceHull { speed: 3000.0 }).unwrap();
+        } else {
+            worker
+                .action(Action::Jog {
+                    x: 1.0,
+                    y: 0.0,
+                    speed: 3000.0,
+                    step: 0.1,
+                })
+                .unwrap();
+        }
+        struct InFlight {
+            command: QueuedCommand,
+            endpoint: f64,
+            sent: f64,
+            arrives: f64,
+            acknowledged: Option<f64>,
+        }
+        let mut in_flight: Option<InFlight> = None;
+        let mut planner: VecDeque<f64> = VecDeque::new();
+        let mut reports: VecDeque<(f64, f64, f64, bool)> = VecDeque::new();
+        let (mut position, mut velocity) = (0.0_f64, 0.0_f64);
+        let (mut next_report, mut last_report, mut extension_at) = (0.0, 0.0, 0.0);
+        let duration = 50.0 / acceleration + 5.0;
+        let dt = 0.002;
+        let mut sustained = 50.0_f64;
+        let mut max_blocks = 0;
+        for tick in 0..(duration / dt).ceil() as usize {
+            let now = tick as f64 * dt;
+            if let Some(&endpoint) = planner.back() {
+                let braking_speed = (2.0 * acceleration * (endpoint - position).max(0.0)).sqrt();
+                let desired = 50.0_f64.min(braking_speed);
+                let next_velocity = if desired > velocity {
+                    (velocity + acceleration * dt).min(desired)
+                } else {
+                    (velocity - acceleration * dt).max(desired)
+                };
+                position = (position + (velocity + next_velocity) * 0.5 * dt).min(endpoint);
+                velocity = if position >= endpoint {
+                    0.0
+                } else {
+                    next_velocity
+                };
+                while planner
+                    .front()
+                    .is_some_and(|&point| point <= position + 1e-9)
+                {
+                    planner.pop_front();
+                }
+            } else {
+                velocity = 0.0;
+            }
+            if let Some(packet) = &mut in_flight
+                && now >= packet.arrives
+                && packet.acknowledged.is_none()
+                && planner.len() < blocks - 1
+            {
+                planner.push_back(packet.endpoint);
+                packet.acknowledged = Some(now + one_way);
+                max_blocks = max_blocks.max(planner.len());
+            }
+            if in_flight
+                .as_ref()
+                .is_some_and(|packet| packet.acknowledged.is_some_and(|ack| now >= ack))
+            {
+                let packet = in_flight.take().unwrap();
+                worker.pending = Some((
+                    packet.command,
+                    Instant::now() - Duration::from_secs_f64(now - packet.sent),
+                ));
+                worker.line("ok").unwrap();
+            }
+            if now >= next_report {
+                reports.push_back((now + one_way, position, velocity, !planner.is_empty()));
+                next_report = now + 0.1;
+            }
+            while reports.front().is_some_and(|sample| now >= sample.0) {
+                let (_, position, velocity, moving) = reports.pop_front().unwrap();
+                worker.s.status.wpos.x = position;
+                worker.s.status.feed = velocity * 60.0;
+                worker.s.status.state = if moving { "Jog" } else { "Idle" }.into();
+                last_report = now;
+            }
+            worker.s.status.at = Some(Instant::now() - Duration::from_secs_f64(now - last_report));
+            let before = worker.jog.as_ref().map(|jog| jog.target);
+            if let Some(jog) = &mut worker.jog {
+                jog.heartbeat = Instant::now();
+                jog.extended = Instant::now() - Duration::from_secs_f64(now - extension_at);
+            }
+            if trace {
+                worker.advance_trace().unwrap();
+            } else {
+                worker.advance_jog().unwrap();
+            }
+            if before != worker.jog.as_ref().map(|jog| jog.target) {
+                extension_at = now;
+            }
+            if in_flight.is_none()
+                && let Some(command) = worker.queue.pop_front()
+            {
+                let endpoint = if trace {
+                    worker.trace.as_ref().unwrap().cursor.x
+                } else {
+                    worker.jog.as_ref().unwrap().cursor.x
+                };
+                worker.pending = Some((command.clone(), Instant::now()));
+                in_flight = Some(InFlight {
+                    command,
+                    endpoint,
+                    sent: now,
+                    arrives: now + one_way,
+                    acknowledged: None,
+                });
+            }
+            if now > duration - 2.0 {
+                sustained = sustained.min(velocity);
+            }
+        }
+        assert!(
+            sustained >= 49.5,
+            "trace={trace}, a={acceleration}, slots={blocks}, RTT={}: sustained {sustained} mm/s",
+            one_way * 2.0
+        );
+        assert!(
+            max_blocks < blocks - 1,
+            "trace={trace}, a={acceleration}, slots={blocks}, one-way={one_way}: {max_blocks} planner blocks used, sustained {sustained}"
+        );
+    }
+
+    #[test]
+    fn jog_and_trace_reach_full_speed_with_acceleration_and_delayed_feedback() {
+        for trace in [false, true] {
+            for (acceleration, slots, one_way) in
+                [(100.0, 16, 0.03), (100.0, 10, 0.07), (5.0, 10, 0.07)]
+            {
+                check_sustained_speed(trace, acceleration, slots, one_way);
+            }
+        }
+    }
+
+    #[test]
+    fn lookahead_uses_the_limiting_axis_and_waits_for_actual_controller_settings() {
+        let (_sim, mut worker) = connected_worker();
+        worker.s.acceleration = [Some(100.0), Some(25.0)];
+        worker.s.options.rapid.y = 600.0;
+        worker.s.status.at = Some(Instant::now());
+        // Direction (.6,.8): Y limits speed to 12.5 mm/s and path
+        // acceleration to 31.25 mm/s². Braking needs 2.5 mm, plus margin.
+        let lookahead = worker
+            .s
+            .jog_lookahead(
+                Point {
+                    x: 0.6,
+                    y: 0.8,
+                    z: 0.0,
+                },
+                3000.0,
+                3000.0,
+                0.01,
+            )
+            .unwrap();
+        assert!((4.625..4.65).contains(&lookahead.refill));
+        assert!((lookahead.segment - 1.25).abs() < 1e-9);
+        worker.s.acceleration[0] = None;
+        assert!(!worker.s.can_jog());
+        worker
+            .line("$/axes/x/acceleration_mm_per_sec2=nan")
+            .unwrap();
+        assert!(!worker.s.can_jog());
+        worker.line("$/axes/x/acceleration_mm_per_sec2=80").unwrap();
+        assert!(worker.s.can_jog());
+        worker.line("Grbl 4.1 [FluidNC reboot]").unwrap();
+        assert_eq!(worker.s.acceleration, [None; 2]);
+        assert_eq!(worker.s.planner_blocks, None);
+        assert!(!worker.s.can_jog());
     }
 
     #[test]
@@ -1751,13 +2289,17 @@ mod tests {
         worker.s.status.wpos.y = 19.7;
         worker.jog.as_mut().unwrap().extended = Instant::now() - Duration::from_millis(101);
         worker.advance_jog().unwrap();
-        assert_eq!(worker.queue[0], "$J=G21G90X10.00000Y18.50000F600.0");
+        assert_eq!(worker.queue[0], "$J=G21G90X10.00000Y18.70000F600.0");
         worker.queue.clear();
         // Without position progress, repeated heartbeats must not run farther ahead.
         for _ in 0..5 {
             worker.jog.as_mut().unwrap().extended = Instant::now() - Duration::from_millis(101);
             worker.advance_jog().unwrap();
-            assert!(worker.queue.is_empty());
+            let jog = worker.jog.as_ref().unwrap();
+            let increments = (20.0 - jog.target.y) / 0.3;
+            assert!((increments - increments.round()).abs() < 1e-8);
+            assert!(jog.cursor.distance(worker.s.status.wpos) < 3.5);
+            worker.queue.clear();
         }
         worker.jog.as_mut().unwrap().heartbeat = Instant::now() - Duration::from_millis(251);
         worker.advance_jog().unwrap();
@@ -1786,6 +2328,157 @@ mod tests {
         worker.pending = Some(("$J=G21G91X1F600".into(), Instant::now()));
         worker.action(Action::CancelJog).unwrap();
         assert_eq!(worker.s.console.len(), cancelled + 1);
+    }
+
+    #[test]
+    fn controller_file_transfers_block_motion_and_overlapping_operations() {
+        let (_sim, mut worker) = connected_worker();
+        worker.s.ready = true;
+        worker.action(Action::ListFiles).unwrap();
+        assert!(worker.s.transferring);
+        assert!(!worker.s.can_run() && !worker.s.can_jog());
+        assert!(worker.action(Action::Run).is_err());
+        assert!(
+            worker
+                .action(Action::Jog {
+                    x: 1.0,
+                    y: 0.0,
+                    speed: 600.0,
+                    step: 1.0
+                })
+                .is_err()
+        );
+        assert!(worker.action(Action::Console("G0X100".into())).is_err());
+        assert!(worker.action(Action::ListFiles).is_err());
+        assert!(
+            worker
+                .action(Action::Load {
+                    name: "other.nc".into(),
+                    text: "G0X1".into()
+                })
+                .is_err()
+        );
+        assert!(
+            worker
+                .action(Action::Connect {
+                    address: "127.0.0.1:1".into(),
+                    http: "http://127.0.0.1:1".into()
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn controller_files_reject_active_motion_and_allow_uninitialized_alarm() {
+        let (_sim, mut worker) = connected_worker();
+        for state in ["Run", "Jog", "Hold:0", "Hold:1"] {
+            worker.s.status.state = state.into();
+            assert!(worker.action(Action::ListFiles).is_err());
+        }
+        worker.s.status.state = "Idle".into();
+        worker.s.status.torch = true;
+        assert!(worker.action(Action::ListFiles).is_err());
+        worker.s.status.torch = false;
+        worker.s.status.state = "Alarm".into();
+        worker.s.initialized = false;
+        worker.action(Action::ListFiles).unwrap();
+        assert!(worker.s.transferring);
+    }
+
+    #[test]
+    fn changing_jog_speed_queues_new_feeds_without_cancelling_motion() {
+        let (_sim, mut worker) = connected_worker();
+        worker
+            .action(Action::Jog {
+                x: 1.0,
+                y: 0.0,
+                speed: 600.0,
+                step: 100.0,
+            })
+            .unwrap();
+        worker.advance_jog().unwrap();
+        worker.queue.clear();
+        let target = worker.jog.as_ref().unwrap().target;
+        for speed in [2400.0, 600.0] {
+            worker.s.status.wpos = worker.jog.as_ref().unwrap().cursor;
+            worker.s.status.state = "Jog".into();
+            worker
+                .action(Action::Jog {
+                    x: 1.0,
+                    y: 0.0,
+                    speed,
+                    step: 100.0,
+                })
+                .unwrap();
+            worker.advance_jog().unwrap();
+            assert!(
+                worker
+                    .queue
+                    .pop_front()
+                    .unwrap()
+                    .ends_with(format!("F{speed:.1}").as_str())
+            );
+            assert_eq!(worker.jog.as_ref().unwrap().target, target);
+            assert!(
+                !worker
+                    .s
+                    .console
+                    .iter()
+                    .any(|line| line.contains("cancel jog"))
+            );
+        }
+        worker.action(Action::FinishJog).unwrap();
+        assert!(worker.jog.as_ref().unwrap().released);
+    }
+
+    #[test]
+    fn changing_trace_speed_keeps_the_edge_and_does_not_cancel_motion() {
+        let (_sim, mut worker) = connected_worker();
+        worker.s.program = Some(Arc::new(
+            gcode::parse(
+                "G21G90\nG0X0Y0\nG1X100Y0F600\nY100\nX0\nY0",
+                worker.s.options,
+            )
+            .unwrap(),
+        ));
+        worker.action(Action::TraceHull { speed: 600.0 }).unwrap();
+        worker.advance_trace().unwrap();
+        worker.queue.clear();
+        let vertex = worker.trace.as_ref().unwrap().points[0];
+        for speed in [2400.0, 600.0] {
+            worker.s.status.wpos = worker.trace.as_ref().unwrap().cursor;
+            worker.s.status.state = "Jog".into();
+            worker.action(Action::JogSpeed { speed }).unwrap();
+            worker.advance_trace().unwrap();
+            assert!(
+                worker
+                    .queue
+                    .pop_front()
+                    .unwrap()
+                    .ends_with(format!("F{speed:.1}").as_str())
+            );
+            let trace = worker.trace.as_ref().unwrap();
+            assert_eq!(trace.next, 0);
+            assert_eq!(trace.points[0], vertex);
+            assert!(
+                !worker
+                    .s
+                    .console
+                    .iter()
+                    .any(|line| line.contains("cancel jog"))
+            );
+        }
+        // Already buffered fast motion is retained, but cannot grow while
+        // position feedback is unchanged after reducing the feed.
+        let before = worker.trace.as_ref().unwrap().cursor;
+        for _ in 0..10 {
+            worker.advance_trace().unwrap();
+            worker.queue.clear();
+        }
+        assert_eq!(worker.trace.as_ref().unwrap().cursor, before);
+        worker.action(Action::CancelTrace).unwrap();
+        worker.advance_trace().unwrap();
+        assert!(worker.trace.is_none() && worker.queue.is_empty() && !worker.s.tracing);
     }
     #[test]
     fn fluidnc_modal_feed_is_already_mm_per_minute_in_inch_mode() {
@@ -1882,6 +2575,8 @@ mod tests {
             .s
             .status
             .update("<Idle|MPos:0,0,0|WCO:0,0,0|Ov:100,100,100>", false);
+        worker.s.acceleration = [Some(100.0); 2];
+        worker.s.planner_blocks = Some(16);
         let original = "M3\nG1X10F60\nM5";
         let previous = gcode::parse(original, worker.s.options).unwrap();
         assert!(!previous.uploaded.contains("G4"));

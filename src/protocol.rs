@@ -2,8 +2,11 @@ use crate::gcode::Point;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::{
+    fs::{self, OpenOptions},
     io::{Read, Write},
     net::{TcpStream, ToSocketAddrs},
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -262,6 +265,44 @@ pub struct FileInfo {
     pub free: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct RemoteFile {
+    pub name: String,
+    pub bytes: usize,
+}
+
+pub fn validate_filename(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty()
+            && name != "."
+            && name != ".."
+            && !name
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '/' | '\\' | '"')),
+        "Choose a filename in the controller's root directory"
+    );
+    Ok(())
+}
+
+pub fn list_files(base: &str) -> Result<Vec<RemoteFile>> {
+    let listing = file_list(base)?;
+    let mut files: Vec<_> = listing["files"]
+        .as_array()
+        .context("Invalid controller file listing")?
+        .iter()
+        .filter_map(|file| {
+            let name = file["name"].as_str()?.trim_start_matches('/');
+            validate_filename(name).ok()?;
+            Some(RemoteFile {
+                name: name.into(),
+                bytes: file_size(&listing, name)?,
+            })
+        })
+        .collect();
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(files)
+}
+
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(2))
@@ -271,17 +312,23 @@ fn agent() -> ureq::Agent {
 }
 
 pub fn file_list(base: &str) -> Result<Value> {
-    Ok(agent()
+    let listing: Value = agent()
         .get(&format!("{base}/files?path=/"))
         .call()
         .context("Read LocalFS listing")?
-        .into_json()?)
+        .into_json()?;
+    ensure!(
+        listing["status"].as_str().is_none_or(|s| s == "Ok"),
+        "Cannot list controller files: {}",
+        listing["status"]
+    );
+    Ok(listing)
 }
-fn file_size(list: &Value) -> Option<usize> {
+fn file_size(list: &Value, name: &str) -> Option<usize> {
     let file = list.get("files")?.as_array()?.iter().find(|f| {
         f["name"]
             .as_str()
-            .is_some_and(|n| n.trim_start_matches('/') == "plasma.nc")
+            .is_some_and(|n| n.trim_start_matches('/') == name)
     })?;
     file["size"]
         .as_u64()
@@ -312,24 +359,22 @@ fn free_space(list: &Value) -> Option<String> {
     ))
 }
 pub fn verify(base: &str, data: &str) -> Result<FileInfo> {
+    verify_file(base, "plasma.nc", data.as_bytes())
+}
+pub fn verify_file(base: &str, name: &str, data: &[u8]) -> Result<FileInfo> {
+    validate_filename(name)?;
     let listing = file_list(base)?;
-    let bytes = file_size(&listing).context("plasma.nc missing from LocalFS")?;
+    let bytes =
+        file_size(&listing, name).with_context(|| format!("{name} missing from controller"))?;
     ensure!(
         bytes == data.len(),
         "Upload size mismatch: expected {}, found {bytes}",
         data.len()
     );
-    let mut downloaded = Vec::new();
-    agent()
-        .get(&format!("{base}/localfs/plasma.nc"))
-        .call()
-        .context("Download for verification")?
-        .into_reader()
-        .take(data.len() as u64 + 1)
-        .read_to_end(&mut downloaded)?;
+    let downloaded = download_bytes(base, name, bytes)?;
     ensure!(
-        downloaded == data.as_bytes(),
-        "Upload contents differ from the local processed file"
+        downloaded == data,
+        "Upload contents differ from the local file"
     );
     Ok(FileInfo {
         bytes,
@@ -339,7 +384,7 @@ pub fn verify(base: &str, data: &str) -> Result<FileInfo> {
 pub fn upload(base: &str, data: &str, mut progress: impl FnMut(&str)) -> Result<FileInfo> {
     progress("Checking LocalFS");
     let listing = file_list(base)?;
-    if file_size(&listing).is_some() {
+    if file_size(&listing, "plasma.nc").is_some() {
         progress("Replacing plasma.nc");
         let result: Value = agent()
             .get(&format!(
@@ -356,18 +401,40 @@ pub fn upload(base: &str, data: &str, mut progress: impl FnMut(&str)) -> Result<
             result["status"]
         );
     }
-    progress("Uploading plasma.nc");
-    let boundary = "PlasmaWiFiBoundary7f6c3d";
-    let body = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"plasma.nc\"\r\nContent-Type: application/octet-stream\r\n\r\n{data}\r\n--{boundary}--\r\n"
-    );
+    upload_file(base, "plasma.nc", data.as_bytes(), progress)
+}
+
+pub fn upload_file(
+    base: &str,
+    name: &str,
+    data: &[u8],
+    mut progress: impl FnMut(&str),
+) -> Result<FileInfo> {
+    validate_filename(name)?;
+    progress(&format!("Uploading {name}"));
+    let mut boundary = "PlasmaWiFiBoundary7f6c3d".to_owned();
+    while data
+        .windows(boundary.len())
+        .any(|bytes| bytes == boundary.as_bytes())
+    {
+        boundary.push('x');
+    }
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+    ).into_bytes();
+    body.extend_from_slice(data);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let mut url = url::Url::parse(&format!("{base}/files"))?;
+    url.query_pairs_mut()
+        .append_pair("path", "/")
+        .append_pair(&format!("{name}S"), &data.len().to_string());
     let response: Value = agent()
-        .post(&format!("{base}/files?path=/&plasma.ncS={}", data.len()))
+        .post(url.as_str())
         .set(
             "Content-Type",
             &format!("multipart/form-data; boundary={boundary}"),
         )
-        .send_bytes(body.as_bytes())?
+        .send_bytes(&body)?
         .into_json()?;
     ensure!(
         response["status"].as_str().is_none_or(|s| s == "Ok"),
@@ -375,7 +442,63 @@ pub fn upload(base: &str, data: &str, mut progress: impl FnMut(&str)) -> Result<
         response["status"]
     );
     progress("Verifying size and contents");
-    verify(base, data)
+    verify_file(base, name, data)
+}
+
+fn download_bytes(base: &str, name: &str, bytes: usize) -> Result<Vec<u8>> {
+    let mut url = url::Url::parse(&format!("{base}/localfs/"))?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("Invalid controller URL"))?
+        .pop_if_empty()
+        .push(name);
+    let mut data = Vec::new();
+    agent()
+        .get(url.as_str())
+        .call()
+        .with_context(|| format!("Download {name}"))?
+        .into_reader()
+        .take(bytes as u64 + 1)
+        .read_to_end(&mut data)?;
+    ensure!(
+        data.len() == bytes,
+        "Download size mismatch: expected {bytes}, received {}",
+        data.len()
+    );
+    Ok(data)
+}
+
+pub fn download_file(base: &str, name: &str, destination: &Path) -> Result<usize> {
+    validate_filename(name)?;
+    let listing = file_list(base)?;
+    let bytes =
+        file_size(&listing, name).with_context(|| format!("{name} missing from controller"))?;
+    let data = download_bytes(base, name, bytes)?;
+    // A failed download/write leaves an existing local backup intact.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let temporary = parent.join(format!(
+        ".plasma-wifi-download-{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .context("Create download file")?;
+    let result = (|| {
+        output.write_all(&data)?;
+        output.sync_all()?;
+        fs::rename(&temporary, destination)?;
+        Ok(bytes)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[cfg(test)]

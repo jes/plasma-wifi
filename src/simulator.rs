@@ -3,6 +3,7 @@ use crate::gcode::{self, ParseOptions, Point, Program};
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::{
+    collections::BTreeMap,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::{Arc, Mutex},
@@ -15,6 +16,7 @@ pub const DEMO: &str = "(Plasma WiFi example: rounded plate and circular cutout)
 #[derive(Default)]
 struct Machine {
     file: String,
+    files: BTreeMap<String, Vec<u8>>,
     program: Option<Program>,
     block: usize,
     block_seconds: f64,
@@ -29,6 +31,8 @@ struct Machine {
     rapid: f64,
     complete: bool,
     jog_until: Option<Instant>,
+    jog_feed: f64,
+    modal: BTreeMap<usize, String>,
     inches: bool,
     modal_inches: bool,
     reboot_banner: bool,
@@ -42,6 +46,86 @@ struct Machine {
     report_torch: bool,
 }
 impl Machine {
+    fn velocity(&self) -> f64 {
+        match self.state() {
+            "Jog" => self.jog_feed,
+            "Run" => self
+                .program
+                .as_ref()
+                .and_then(|p| p.blocks.get(self.block))
+                .map_or(0.0, |block| {
+                    let seconds = block.time.seconds(self.feed, self.rapid, 1.0);
+                    if seconds > 0.0 {
+                        block
+                            .path
+                            .windows(2)
+                            .map(|points| points[0].distance(points[1]))
+                            .sum::<f64>()
+                            * 60.0
+                            / seconds
+                    } else {
+                        0.0
+                    }
+                }),
+            _ => 0.0,
+        }
+    }
+    fn modal_report(&self) -> String {
+        let defaults = [
+            "G0", "G54", "G17", "G21", "G90", "G94", "M5", "M9", "T0", "F0", "S0",
+        ];
+        let words = defaults
+            .iter()
+            .enumerate()
+            .map(|(index, default)| {
+                if index == 3 {
+                    if self.modal_inches { "G20" } else { "G21" }
+                } else {
+                    self.modal.get(&index).map_or(*default, String::as_str)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("[GC:{words}]\n")
+    }
+    fn update_modals(&mut self, command: &str) {
+        let command = command.to_ascii_uppercase();
+        for (start, letter) in command
+            .char_indices()
+            .filter(|(_, ch)| ch.is_ascii_alphabetic())
+        {
+            let value = &command[start + 1..];
+            let end = value
+                .find(|ch: char| ch.is_ascii_alphabetic())
+                .unwrap_or(value.len());
+            let Ok(mut value) = value[..end].trim().parse::<f64>() else {
+                continue;
+            };
+            let index = match (letter, value) {
+                ('G', 0.0..=3.0 | 80.0) => 0,
+                ('G', 54.0..=59.3) => 1,
+                ('G', 17.0..=19.0) => 2,
+                ('G', 20.0 | 21.0) => {
+                    self.modal_inches = value == 20.0;
+                    3
+                }
+                ('G', 90.0 | 91.0) => 4,
+                ('G', 93.0 | 94.0) => 5,
+                ('M', 3.0..=5.0) => 6,
+                ('M', 7.0..=9.0) => 7,
+                ('T', _) => 8,
+                ('F', _) => {
+                    if self.modal_inches {
+                        value *= 25.4;
+                    }
+                    9
+                }
+                ('S', _) => 10,
+                _ => continue,
+            };
+            self.modal.insert(index, format!("{letter}{value}"));
+        }
+    }
     fn state(&self) -> &str {
         if self.alarm.is_some() {
             "Alarm"
@@ -104,12 +188,12 @@ impl Machine {
         };
         let scale = if self.inches { 25.4 } else { 1.0 };
         format!(
-            "<{}|MPos:{:.4},{:.4},{:.4}{wco}{line}|FS:{},{}{overrides}{file}>\n",
+            "<{}|MPos:{:.4},{:.4},{:.4}{wco}{line}|FS:{:.0},{}{overrides}{file}>\n",
             self.state(),
             (self.position.x + self.wco.x) / scale,
             (self.position.y + self.wco.y) / scale,
             (self.position.z + self.wco.z) / scale,
-            if self.state() == "Run" { 1200 } else { 0 },
+            self.velocity() / scale,
             if self.torch { 1 } else { 0 },
         )
     }
@@ -129,6 +213,7 @@ impl Machine {
         if self.block_seconds == 0.0 {
             self.torch = block.torch;
         }
+        let code = block.code.clone();
         let duration = block.time.seconds(self.feed, self.rapid, 1.0);
         self.block_seconds += dt;
         if !block.path.is_empty() {
@@ -146,6 +231,7 @@ impl Machine {
             self.block += 1;
             self.block_seconds = 0.0;
         }
+        self.update_modals(&code);
     }
     fn command(&mut self, command: &str) -> String {
         self.commands.push(command.into());
@@ -166,13 +252,16 @@ impl Machine {
             return "[VER:4.1:FluidNC v4.1.1 (simulator)]\nok\n".into();
         }
         if command == "$G" {
-            return format!(
-                "[GC:G0 G54 G17 {} G90 G94 M5 M9 T0 F0 S0]\nok\n",
-                if self.modal_inches { "G20" } else { "G21" }
-            );
+            return self.modal_report() + "ok\n";
         }
         if command == "$use_line_numbers" {
             return "$/use_line_numbers=true\nok\n".into();
+        }
+        if command == "$planner_blocks" {
+            return "$/planner_blocks=16\nok\n".into();
+        }
+        if command.starts_with("$axes/") && command.ends_with("/acceleration_mm_per_sec2") {
+            return format!("$/{}=100\nok\n", command.trim_start_matches('$'));
         }
         if command.starts_with("$axes/") {
             return format!("$/{}=3000\nok\n", command.trim_start_matches('$'));
@@ -218,6 +307,7 @@ impl Machine {
                 }
             }
             self.jog_until = Some(Instant::now() + Duration::from_millis(140));
+            self.jog_feed = word(command, 'F').unwrap_or(600.0);
         }
         if command == "G21" || command == "G21G54" {
             self.modal_inches = false;
@@ -249,6 +339,9 @@ impl Machine {
                 self.position.z = value;
             }
         }
+        if !command.starts_with('$') && !command.starts_with("G10") {
+            self.update_modals(command);
+        }
         "ok\n".into()
     }
 }
@@ -276,6 +369,10 @@ impl Simulator {
         let machine = Arc::new(Mutex::new(Machine {
             feed: 1.0,
             rapid: 1.0,
+            files: BTreeMap::from([(
+                "config.yaml".into(),
+                include_bytes!("../config.yaml").to_vec(),
+            )]),
             ..Default::default()
         }));
         let state = machine.clone();
@@ -360,6 +457,7 @@ fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()
     let mut interval = None;
     let mut last_report = Instant::now();
     let mut last_report_state = String::new();
+    let mut last_modal = String::new();
     loop {
         {
             let mut m = state.lock().unwrap();
@@ -384,6 +482,13 @@ fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()
                 stream.write_all(m.status(interval.is_some()).as_bytes())?;
                 last_report_state = m.state().into();
                 last_report = Instant::now();
+            }
+            if interval.is_some() {
+                let modal = m.modal_report();
+                if modal != last_modal {
+                    stream.write_all(modal.as_bytes())?;
+                    last_modal = modal;
+                }
             }
             if m.complete {
                 stream.write_all(b"ok\n")?;
@@ -436,6 +541,8 @@ fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()
                     m.torch = false;
                     m.override_stopped = false;
                     m.jog_until = None;
+                    m.modal.clear();
+                    m.modal_inches = false;
                     line.clear();
                     interval = None;
                     m.report_count = 0;
@@ -534,15 +641,39 @@ fn http_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()> 
             .position(|v| v == marker.as_bytes())
             .context("No multipart terminator")?
             + start;
-        m.file = String::from_utf8(body[start..end].to_vec())?;
+        let disposition = std::str::from_utf8(&body[..start])?;
+        let name = disposition
+            .split("filename=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .context("Missing multipart filename")?;
+        let bytes = body[start..end].to_vec();
+        if name == "plasma.nc" {
+            m.file = String::from_utf8(bytes)?;
+        } else {
+            m.files.insert(name.into(), bytes);
+        }
         (200, "application/json", listing(&m))
     } else if path.starts_with("/files") {
         if path.contains("action=delete") {
-            m.file.clear();
+            let url = url::Url::parse(&format!("http://sim{path}"))?;
+            if let Some((_, name)) = url.query_pairs().find(|(key, _)| key == "filename") {
+                if name == "plasma.nc" {
+                    m.file.clear();
+                } else {
+                    m.files.remove(name.as_ref());
+                }
+            }
         }
         (200, "application/json", listing(&m))
     } else if path == "/localfs/plasma.nc" {
         (200, "application/octet-stream", m.file.as_bytes().to_vec())
+    } else if let Some(bytes) = m.files.iter().find_map(|(name, bytes)| {
+        let mut url = url::Url::parse("http://sim/localfs/").unwrap();
+        url.path_segments_mut().unwrap().pop_if_empty().push(name);
+        (url.path() == path).then_some(bytes.clone())
+    }) {
+        (200, "application/octet-stream", bytes)
     } else {
         (404, "text/plain", b"Not found".to_vec())
     };
@@ -551,7 +682,19 @@ fn http_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()> 
     Ok(())
 }
 fn listing(m: &Machine) -> Vec<u8> {
-    serde_json::to_vec(&json!({"files":if m.file.is_empty(){vec![]}else{vec![json!({"name":"plasma.nc","size":m.file.len()})]},"total":"1.00 MB","used":format!("{} B",m.file.len()),"status":"Ok"})).unwrap()
+    let mut files: Vec<_> = m
+        .files
+        .iter()
+        .map(|(name, bytes)| json!({"name":name,"size":bytes.len()}))
+        .collect();
+    if !m.file.is_empty() {
+        files.push(json!({"name":"plasma.nc","size":m.file.len()}));
+    }
+    let used = m.file.len() + m.files.values().map(Vec::len).sum::<usize>();
+    serde_json::to_vec(
+        &json!({"files":files,"total":"1.00 MB","used":format!("{used} B"),"status":"Ok"}),
+    )
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -561,6 +704,55 @@ mod tests {
         controller::{Action, Controller, Snapshot},
         protocol,
     };
+    #[test]
+    fn readouts_follow_auto_modal_reports_and_realtime_feed() {
+        let sim = Simulator::start().unwrap();
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
+        wait(&controller, |s| s.initialized && s.modal.contains("G90"));
+        let queries = sim
+            .machine
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .filter(|c| *c == "$G")
+            .count();
+        sim.machine.lock().unwrap().update_modals("G20G91");
+        wait(&controller, |s| {
+            s.modal.contains("G20") && s.modal.contains("G91")
+        });
+        assert_eq!(
+            sim.machine
+                .lock()
+                .unwrap()
+                .commands
+                .iter()
+                .filter(|c| *c == "$G")
+                .count(),
+            queries
+        );
+        controller.send(Action::Console("G21G90".into()));
+        wait(&controller, |s| {
+            s.options.initial_mm && s.options.initial_absolute
+        });
+        controller.send(Action::Load {
+            name: "readouts.nc".into(),
+            text: "G21G90\nM3S1\nG1X100F600\nM5\n".into(),
+        });
+        wait(&controller, |s| s.can_run());
+        controller.send(Action::Run);
+        wait(&controller, |s| {
+            s.job && s.status.feed == 600.0 && s.modal.contains("G1 ")
+        });
+        controller.send(Action::Feed(0x91));
+        wait(&controller, |s| s.status.feed == 660.0);
+        controller.send(Action::Pause);
+        wait(&controller, |s| {
+            s.status.held() && s.status.feed == 0.0 && !s.status.torch
+        });
+        controller.send(Action::Stop);
+        wait(&controller, |s| !s.job && s.status.idle());
+    }
     fn wait(controller: &Controller, condition: impl Fn(&Snapshot) -> bool) -> Snapshot {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -977,6 +1169,123 @@ mod tests {
         assert!(protocol::verify(&sim.http, data).is_err());
     }
     #[test]
+    fn arbitrary_controller_files_round_trip_binary_names_and_empty_files() {
+        let sim = Simulator::start().unwrap();
+        let scratch = CheckpointFile::new();
+        let folder = scratch.0.parent().unwrap();
+        std::fs::create_dir_all(folder).unwrap();
+        let destination = folder.join("backup.bin");
+        let data = b"\0\xff\xfe\r\nPlasmaWiFiBoundary7f6c3d\r\nunchanged bytes\0";
+        for (name, data) in [
+            ("settings + #%? résumé.bin", data.as_slice()),
+            ("empty.txt", b"".as_slice()),
+        ] {
+            let info = protocol::upload_file(&sim.http, name, data, |_| {}).unwrap();
+            assert_eq!(info.bytes, data.len());
+            assert_eq!(
+                protocol::download_file(&sim.http, name, &destination).unwrap(),
+                data.len()
+            );
+            assert_eq!(std::fs::read(&destination).unwrap(), data);
+            assert!(
+                protocol::list_files(&sim.http)
+                    .unwrap()
+                    .iter()
+                    .any(|file| file.name == name && file.bytes == data.len())
+            );
+        }
+        let original = sim.machine.lock().unwrap().files["config.yaml"].clone();
+        assert!(protocol::upload_file(&sim.http, "../config.yaml", b"bad", |_| {}).is_err());
+        assert_eq!(sim.machine.lock().unwrap().files["config.yaml"], original);
+        std::fs::write(&destination, b"existing backup").unwrap();
+        assert!(protocol::download_file(&sim.http, "missing.yaml", &destination).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"existing backup");
+    }
+
+    #[test]
+    fn config_transfers_preserve_the_loaded_job_and_work_in_alarm() {
+        let sim = Simulator::start().unwrap();
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
+        wait(&controller, |s| s.initialized && s.status.position_known);
+        controller.send(Action::Load {
+            name: "job.nc".into(),
+            text: "G21G90\nG1X100F60\nM30".into(),
+        });
+        wait(&controller, |s| s.can_run());
+        let job = sim.machine.lock().unwrap().file.clone();
+        let scratch = CheckpointFile::new();
+        let folder = scratch.0.parent().unwrap();
+        std::fs::create_dir_all(folder).unwrap();
+        let config = folder.join("config.yaml");
+        controller.send(Action::ListFiles);
+        wait(&controller, |s| {
+            !s.transferring && s.files.iter().any(|f| f.name == "config.yaml")
+        });
+        controller.send(Action::DownloadFile {
+            name: "config.yaml".into(),
+            path: config.clone(),
+        });
+        wait(&controller, |s| {
+            s.files_message.starts_with("Downloaded config.yaml")
+        });
+        assert_eq!(
+            std::fs::read(&config).unwrap(),
+            include_bytes!("../config.yaml")
+        );
+        let changed = b"# Keep comments and precision\r\nname: test\r\nuse_line_numbers: true\r\n";
+        std::fs::write(&config, changed).unwrap();
+        controller.send(Action::UploadFile {
+            path: config.clone(),
+        });
+        let uploaded = wait(&controller, |s| {
+            s.files_message.starts_with("Uploaded config.yaml") && !s.transferring
+        });
+        assert!(uploaded.can_run());
+        assert_eq!(sim.machine.lock().unwrap().files["config.yaml"], changed);
+        assert_eq!(sim.machine.lock().unwrap().file, job);
+        sim.machine.lock().unwrap().alarm = Some(3);
+        wait(&controller, |s| s.status.state == "Alarm");
+        controller.send(Action::DownloadFile {
+            name: "config.yaml".into(),
+            path: folder.join("alarm-backup.yaml"),
+        });
+        wait(&controller, |s| {
+            !s.transferring && s.files_message.contains("alarm-backup.yaml")
+        });
+        assert_eq!(
+            std::fs::read(folder.join("alarm-backup.yaml")).unwrap(),
+            changed
+        );
+        assert_eq!(sim.machine.lock().unwrap().alarm, Some(3));
+        assert!(
+            !sim.commands()
+                .iter()
+                .any(|command| command == "$X" || command.starts_with("$LocalFS/Run="))
+        );
+    }
+
+    #[test]
+    fn replacing_plasma_through_files_invalidates_the_selected_job() {
+        let sim = Simulator::start().unwrap();
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
+        wait(&controller, |s| s.initialized && s.status.position_known);
+        controller.send(Action::Load {
+            name: "job.nc".into(),
+            text: "G21G90\nG1X100F60\nM30".into(),
+        });
+        wait(&controller, |s| s.can_run());
+        let scratch = CheckpointFile::new();
+        std::fs::create_dir_all(scratch.0.parent().unwrap()).unwrap();
+        let path = scratch.0.with_file_name("plasma.nc");
+        std::fs::write(&path, "G0X12\n").unwrap();
+        controller.send(Action::UploadFile { path });
+        let uploaded = wait(&controller, |s| {
+            s.files_message.starts_with("Uploaded plasma.nc")
+        });
+        assert!(!uploaded.ready && !uploaded.can_run());
+        assert_eq!(sim.machine.lock().unwrap().file, "G0X12\n");
+    }
+    #[test]
     fn completion_ack_handles_jobs_shorter_than_status_poll_interval() {
         let sim = Simulator::start().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
@@ -1024,7 +1333,7 @@ mod tests {
         assert!(done.status.wpos.distance(start) < 0.001);
         let commands = sim.commands();
         let jogs: Vec<_> = commands.iter().filter(|c| c.starts_with("$J=")).collect();
-        assert_eq!(jogs.len(), 6); // four hull vertices, close, return
+        assert!(jogs.len() > 6); // Short queued segments visit every vertex, close, return.
         for command in &jogs {
             assert!(command.starts_with("$J=G21G90X") && command.ends_with("F777.0"));
             assert!(!command.contains('Z') && !command.contains("M3"));
