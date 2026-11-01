@@ -26,6 +26,8 @@ pub struct Status {
     pub wco_known: bool,
     pub line: Option<usize>,
     pub feed_override: f64,
+    pub override_at: Option<Instant>,
+    pub planner_free: Option<usize>,
     pub rapid_override: f64,
     pub feed: f64,
     pub torch: bool,
@@ -45,6 +47,8 @@ impl Default for Status {
             wco_known: false,
             line: None,
             feed_override: 1.0,
+            override_at: None,
+            planner_free: None,
             rapid_override: 1.0,
             feed: 0.0,
             torch: false,
@@ -75,6 +79,7 @@ impl Status {
         self.line = None;
         self.file = None;
         self.file_percent = None;
+        self.planner_free = None;
         let scale = if inches { 25.4 } else { 1.0 };
         let mut mpos = None;
         let mut wpos = None;
@@ -100,7 +105,11 @@ impl Status {
                     .unwrap_or(0.0)
                     * scale;
             }
+            if let Some(v) = part.strip_prefix("Bf:") {
+                self.planner_free = v.split(',').next().and_then(|v| v.parse().ok());
+            }
             if let Some(v) = part.strip_prefix("Ov:") {
+                self.override_at = Some(Instant::now());
                 let mut values = v.split(',').filter_map(|v| v.parse::<f64>().ok());
                 self.feed_override = values.next().unwrap_or(100.0) / 100.0;
                 self.rapid_override = values.next().unwrap_or(100.0) / 100.0;

@@ -123,3 +123,8 @@ Add a physical convex-hull trace of the loaded job, like UGS Platform: follow it
 speed with the torch off, as a sanity check of physical travel before cutting. Show the hull in the preview. Include the
 job’s rapid travel and arc extrema. Return to the starting position after the outline. Allow cancellation, and prohibit
 tracing during a running or paused job, uploading, or manual jogging. Tracing must not execute the file or ignite the torch.
+
+
+Manual jogging keeps separate per-axis incremental destinations and held travel. Taps accumulate even before position feedback arrives; holding is detected by elapsed time, independent of OS repeat. Releasing a held axis immediately cancels both its initial step and queued held travel; it must not resume toward the original increment after braking. Genuine taps on other axes and other held axes remain active. Shift remains four times normal jog feed, capped at 3000 mm/min. Ctrl-clicking the toolpath jogs to that XY work position.
+
+Hull tracing uses normal torch-off XY G1 motion at four times the selected jog feed, with 25% realtime feed override normally and 100% while Shift is held. Save and restore the user's override and changed parser modes; confirm restoration before re-enabling motion. Cancel with hold, stopped-position confirmation, and planner reset. Persist pending restoration per controller and recover it after reconnects or app restarts without replaying trace motion.

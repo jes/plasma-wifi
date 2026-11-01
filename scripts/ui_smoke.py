@@ -128,6 +128,21 @@ try:
     assert icon.value[0:2].tolist()==[32,32]
     d.close()
 
+    # Ctrl-click uses work coordinates and jogs to the selected preview point.
+    click(450, 400)
+    before_click = state()
+    count = len([c for c in before_click["commands"] if c.startswith("$J=")])
+    command("keydown", "Control_L")
+    click(750, 350)
+    command("keyup", "Control_L")
+    wait(lambda s: s["state"] == "Idle" and len([c for c in s["commands"] if c.startswith("$J=")]) > count
+         and abs(s["x"] - before_click["x"]) + abs(s["y"] - before_click["y"]) > 1,
+         "Ctrl-click did not jog to the preview position")
+    time.sleep(0.2)
+    click(30, 130)
+    click(30, 176)
+    wait(lambda s: abs(s["x"]) < 0.001 and abs(s["y"]) < 0.001, "Could not zero work coordinates after preview jog")
+
     # Editing the DRO changes the work offset, never physical position.
     before = state()
     click(130, 130)
@@ -203,6 +218,39 @@ try:
     command("keyup", "Right")
     wait(lambda s: s["state"] == "Idle", "Jog did not cancel on key release")
     assert state()["mpos_x"] > before["mpos_x"], "Arrow key did not jog"
+
+    # Holding past OS autorepeat must not create extra taps. Even with a
+    # large initial increment, key release must cancel immediately and stop
+    # within communication latency plus the simulator's braking distance.
+    subprocess.run(["xset", "r", "rate", "200", "30"], check=True)
+    edit_shortcut("i", "100")
+    click(450, 400)
+    for boosted in [False, True]:
+        before_hold = state()
+        if boosted:
+            command("keydown", "Shift_L")
+        command("keydown", "Right")
+        time.sleep(1.0)
+        moving = state()
+        assert moving["state"] == "Jog" and moving["velocity"] > 0
+        assert moving["jog_cancel_count"] == before_hold["jog_cancel_count"], "OS autorepeat generated new tap cancellations"
+        released_at = time.monotonic()
+        command("keyup", "Right")
+        cancelled = wait(lambda s: s["jog_cancel_count"] > moving["jog_cancel_count"],
+                         "Key release did not immediately cancel the queued jog", timeout=0.25)
+        cancel_latency = time.monotonic() - released_at
+        stopped = wait(lambda s: s["state"] == "Idle", "Held release did not finish braking", timeout=1.2)
+        stop_latency = time.monotonic() - released_at
+        extra = stopped["x"] - moving["x"]
+        velocity = moving["velocity"] / 60.0
+        assert 0 <= extra <= velocity * velocity / 200.0 + velocity * 0.2 + 0.2, "Held release travelled beyond latency and braking distance"
+        time.sleep(0.3)
+        assert abs(state()["x"] - stopped["x"]) < 0.001, "Held release resumed the original increment"
+        if boosted:
+            command("keyup", "Shift_L")
+        print(f"Held release {'boosted' if boosted else 'normal'}: cancel {cancel_latency*1000:.0f} ms, stop {stop_latency*1000:.0f} ms, travel {extra:.2f} mm")
+    edit_shortcut("i", "1")
+    click(450, 400)
 
     # Loss of focus must cancel jogging even without receiving a key release.
     command("keydown", "Left")
@@ -363,32 +411,37 @@ try:
         wait(lambda s: "G0X10Y0" in s["file"] and "G1X10Y10F600" in s["file"], "Native picker did not load and upload file")
     command("windowfocus", window)
     time.sleep(0.6)
+    click(292, 545)  # Borrow and restore a nondefault cutting override.
+    wait(lambda s: abs(s["feed_override"] - 1.1) < 0.001, "Could not set user feed override before tracing")
+    time.sleep(0.2)
     start=state()
     previous=len(start["commands"])
     click(135, 924)  # Trace hull at jog speed
-    wait(lambda s: s["state"]=="Jog", "Hull trace did not start")
+    wait(lambda s: s["state"]=="Run" and abs(s["feed_override"]-0.25)<0.001, "Hull trace did not start as normal feed motion")
     screenshot("hull-trace.png")
-    target=f"$J=G21G90X{start['x']:.5f}Y{start['y']:.5f}F600.0"
+    target=f"G21G90G94G1X{start['x']:.5f}Y{start['y']:.5f}F2400.0"
     traced=wait(lambda s: target in s["commands"][previous:] and s["state"]=="Idle"
-                and abs(s["x"]-start["x"])<0.001 and abs(s["y"]-start["y"])<0.001,
-                "Hull trace did not close and return")
+                and abs(s["x"]-start["x"])<0.001 and abs(s["y"]-start["y"])<0.001
+                and abs(s["feed_override"]-start["feed_override"])<0.001,
+                "Hull trace did not close, return, and restore feed override")
     assert not traced["torch"], "Hull trace lit the torch"
+    assert not any(c.startswith("$J=") for c in traced["commands"][previous:]), "Hull trace used jog commands"
     time.sleep(0.3)
     click(135, 924)
-    wait(lambda s: s["state"]=="Jog", "Second hull trace did not start")
-    baseline = len(state()["commands"])
+    wait(lambda s: s["state"]=="Run" and abs(s["feed_override"]-0.25)<0.001, "Second hull trace did not start")
     command("keydown", "Shift_L")
-    wait(lambda s: any(c.startswith("$J=") and c.endswith("F2400.0") for c in s["commands"][baseline:]),
-         "Holding Shift did not boost the active hull trace")
-    baseline = len(state()["commands"])
+    wait(lambda s: s["state"]=="Run" and abs(s["feed_override"]-1.0)<0.001,
+         "Holding Shift did not boost the active hull trace through realtime feed override")
     command("keyup", "Shift_L")
-    wait(lambda s: any(c.startswith("$J=") and c.endswith("F600.0") for c in s["commands"][baseline:]),
-         "Releasing Shift did not slow the active hull trace")
+    wait(lambda s: s["state"]=="Run" and abs(s["feed_override"]-0.25)<0.001,
+         "Releasing Shift did not slow the active hull trace through realtime feed override")
     click(135, 924)  # Cancel hull trace
-    wait(lambda s: s["state"]=="Idle", "Hull cancellation did not stop jogging")
-    count=len(state()["commands"])
+    wait(lambda s: s["state"]=="Idle" and abs(s["feed_override"]-start["feed_override"])<0.001,
+         "Hull cancellation did not stop motion and restore feed override")
+    time.sleep(0.3)
+    count=sum(c.startswith(("G21G90G94G1", "$J=")) for c in state()["commands"])
     time.sleep(0.4)
-    assert len(state()["commands"])==count, "Hull trace continued after cancellation"
+    assert sum(c.startswith(("G21G90G94G1", "$J=")) for c in state()["commands"])==count, "Hull trace continued motion after cancellation"
 
     # Download config, upload an exact replacement, and save the changed bytes.
     click(898, 22)  # Files
@@ -457,7 +510,7 @@ try:
     scrolled = Image.open(screenshot("small-scrolled.png"))
     assert scrolled.crop((0, 80, 344, 460)).tobytes() == fixed_before, "Scrolling hid or moved the DRO / Run / Pause / Stop"
     assert process.poll() is None
-    print("GUI smoke checks passed: native picker/cancel/upload, config upload/download/save/cancel, icon, G/M console/Escape/history/input focus, R/P/S run/pause/resume/stop, O/Ctrl+O open, syntax colors/line numbers, X/Y and /2, F/I numeric edits, jog tap/hold/Shift boost/focus, Run/Pause/Resume/Stop, hull/Shift boost/return/cancel, resize")
+    print("GUI smoke checks passed: native picker/cancel/upload, config upload/download/save/cancel, icon, G/M console/Escape/history/input focus, R/P/S run/pause/resume/stop, O/Ctrl+O open, syntax colors/line numbers, X/Y and /2, F/I numeric edits, jog tap/hold/release latency/autorepeat/Shift boost/focus, Run/Pause/Resume/Stop, Ctrl-click navigation, G1 hull/realtime Shift/return/cancel/override restoration, resize")
     print("Screenshots:", ROOT / "dist")
 finally:
     if process.poll() is None:

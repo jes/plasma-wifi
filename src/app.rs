@@ -1031,7 +1031,10 @@ impl App {
                 } else {
                     button
                 };
-                if ui.add_enabled(self.snapshot.connected, button).clicked() {
+                if ui
+                    .add_enabled(self.snapshot.connected && !self.snapshot.tracing, button)
+                    .clicked()
+                {
                     self.controller.send(Action::Feed(byte));
                 }
             }
@@ -1157,7 +1160,7 @@ impl App {
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new("pointer_jog"), pointer_jog));
         ui.small("Hold Shift: ×4 jog speed (max 3000 mm/min)");
-        ui.small("Tap: one increment · hold: keep moving");
+        ui.small("Tap: one increment · release hold: stop");
         ui.small("Arrow keys: X/Y · Esc: cancel jog");
         ui.small(format!(
             "Torch: {}",
@@ -1186,7 +1189,8 @@ impl App {
         {
             self.show_hull = true;
             self.controller.send(Action::TraceHull {
-                speed: self.jog_feed(ui.input(|input| input.modifiers.shift)),
+                speed: self.settings.jog_speed,
+                boosted: ui.input(|input| input.modifiers.shift),
             });
         }
         ui.small("X/Y: edit position · G/M: console");
@@ -1195,10 +1199,12 @@ impl App {
         (self.settings.jog_speed * if boosted { 4.0 } else { 1.0 }).min(3000.0)
     }
     fn jog_input(&mut self, ctx: &egui::Context) {
-        if self.snapshot.tracing
-            || self.snapshot.status.state == "Jog"
-            || self.snapshot.jog_restarting
-        {
+        if self.snapshot.tracing {
+            self.controller.send(Action::TraceSpeed {
+                boosted: ctx.input(|input| input.focused && input.modifiers.shift),
+            });
+        }
+        if self.snapshot.status.state == "Jog" || self.snapshot.jog_restarting {
             self.controller.send(Action::JogSpeed {
                 speed: self.jog_feed(ctx.input(|input| input.focused && input.modifiers.shift)),
             });
@@ -1215,63 +1221,83 @@ impl App {
             || ctx.input(|i| i.key_down(egui::Key::Escape) || i.key_pressed(egui::Key::Escape))
             || !self.snapshot.can_jog()
             || self.snapshot.status.torch;
-        let direction = if interrupted {
-            None
-        } else if pointer.is_some() {
-            pointer
+        let (directions, presses, boosted) = if interrupted {
+            ([0, 0], [0, 0], false)
+        } else if let Some((x, y, boosted)) = pointer {
+            let raw = [x as i8, y as i8];
+            let down = ctx.input(|i| i.pointer.primary_down());
+            let pressed = ctx.input(|i| i.pointer.primary_pressed()) || !self.was_jogging && !down;
+            (
+                if down { raw } else { [0, 0] },
+                if pressed { raw.map(i32::from) } else { [0, 0] },
+                boosted,
+            )
         } else if !ctx.egui_wants_keyboard_input() {
             ctx.input(|i| {
-                let allowed = |modifiers: egui::Modifiers| {
-                    !modifiers.ctrl && !modifiers.alt && !modifiers.command
-                };
-                let x = i.key_down(egui::Key::ArrowRight) as i32
-                    - i.key_down(egui::Key::ArrowLeft) as i32;
-                let y =
-                    i.key_down(egui::Key::ArrowUp) as i32 - i.key_down(egui::Key::ArrowDown) as i32;
-                if (x != 0 || y != 0) && allowed(i.modifiers) {
-                    Some((x as f64, y as f64, i.modifiers.shift))
+                let allowed = !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.command;
+                let directions = if allowed {
+                    [
+                        i8::from(i.key_down(egui::Key::ArrowRight))
+                            - i8::from(i.key_down(egui::Key::ArrowLeft)),
+                        i8::from(i.key_down(egui::Key::ArrowUp))
+                            - i8::from(i.key_down(egui::Key::ArrowDown)),
+                    ]
                 } else {
-                    // A tap, including Shift, can begin and end between frames.
-                    // Use the modifiers at key-down rather than after release.
-                    i.events.iter().find_map(|event| match event {
-                        egui::Event::Key {
+                    [0, 0]
+                };
+                let mut presses = [0, 0];
+                let mut boosted = i.modifiers.shift;
+                for event in &i.events {
+                    if let egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } = event
+                        && !modifiers.ctrl
+                        && !modifiers.alt
+                        && !modifiers.command
+                    {
+                        if matches!(
                             key,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if allowed(*modifiers) => match key {
-                            egui::Key::ArrowRight => Some((1.0, 0.0, modifiers.shift)),
-                            egui::Key::ArrowLeft => Some((-1.0, 0.0, modifiers.shift)),
-                            egui::Key::ArrowUp => Some((0.0, 1.0, modifiers.shift)),
-                            egui::Key::ArrowDown => Some((0.0, -1.0, modifiers.shift)),
-                            _ => None,
-                        },
-                        _ => None,
-                    })
+                            egui::Key::ArrowRight
+                                | egui::Key::ArrowLeft
+                                | egui::Key::ArrowUp
+                                | egui::Key::ArrowDown
+                        ) {
+                            boosted = modifiers.shift;
+                        }
+                        match key {
+                            egui::Key::ArrowRight => presses[0] += 1,
+                            egui::Key::ArrowLeft => presses[0] -= 1,
+                            egui::Key::ArrowUp => presses[1] += 1,
+                            egui::Key::ArrowDown => presses[1] -= 1,
+                            _ => {}
+                        }
+                    }
                 }
+                (directions, presses, boosted)
             })
         } else {
-            None
+            ([0, 0], [0, 0], false)
         };
-        if let Some((x, y, boosted)) =
-            direction.filter(|_| self.snapshot.can_jog() && !self.snapshot.status.torch)
+        if interrupted || ctx.egui_wants_keyboard_input() && pointer.is_none() {
+            if self.was_jogging {
+                self.controller.send(Action::CancelJog);
+            }
+            self.was_jogging = false;
+        } else if (directions != [0, 0] || presses != [0, 0] || self.was_jogging)
+            && self.snapshot.can_jog()
+            && !self.snapshot.status.torch
         {
-            self.controller.send(Action::Jog {
-                x,
-                y,
+            self.controller.send(Action::JogInput {
+                directions,
+                presses,
                 speed: self.jog_feed(boosted),
                 step: self.settings.jog_increment,
             });
-            self.was_jogging = true;
-        } else if self.was_jogging {
-            self.controller
-                .send(if interrupted || ctx.egui_wants_keyboard_input() {
-                    Action::CancelJog
-                } else {
-                    Action::FinishJog
-                });
-            self.was_jogging = false;
+            self.was_jogging = directions != [0, 0];
         }
         // A released increment may still be completing when focus is lost.
         if interrupted && !self.jog_interrupted && !self.snapshot.tracing {
@@ -1289,8 +1315,10 @@ impl App {
             ui.checkbox(&mut self.show_hull, "Hull");
             ui.small("Wheel: zoom · drag: pan");
         });
-        let (response, painter) =
-            ui.allocate_painter(Vec2::new(ui.available_width(), height), egui::Sense::drag());
+        let (response, painter) = ui.allocate_painter(
+            Vec2::new(ui.available_width(), height),
+            egui::Sense::click_and_drag(),
+        );
         let rect = response.rect;
         painter.rect_filled(rect, 0.0, Color32::BLACK);
         if response.dragged() {
@@ -1337,6 +1365,20 @@ impl App {
                 rect.center().y - (p.y - center.y) as f32 * scale + self.pan.y,
             )
         };
+        if response.clicked()
+            && ui.input(|i| i.modifiers.ctrl)
+            && self.snapshot.can_jog()
+            && !self.snapshot.status.torch
+            && !ui.ctx().egui_wants_keyboard_input()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            self.controller.send(Action::JogTo {
+                x: center.x + ((pointer.x - rect.center().x - self.pan.x) / scale) as f64,
+                y: center.y - ((pointer.y - rect.center().y - self.pan.y) / scale) as f64,
+                speed: self.jog_feed(ui.input(|i| i.modifiers.shift)),
+            });
+        }
+        response.on_hover_text("Ctrl-click: jog to this work position · drag: pan · wheel: zoom");
         let painter = painter.with_clip_rect(rect);
         let spacing = 10f64.powf((60.0 / scale as f64).log10().floor()).max(0.001);
         if ((max.x - min.x) / spacing + (max.y - min.y) / spacing) < 300.0 {

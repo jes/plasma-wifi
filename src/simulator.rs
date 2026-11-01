@@ -3,7 +3,7 @@ use crate::gcode::{self, ParseOptions, Point, Program};
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::{Arc, Mutex},
@@ -13,11 +13,24 @@ use std::{
 
 pub const DEMO: &str = "(Plasma WiFi example: rounded plate and circular cutout)\nG21 G90 G17 G94\nG54\nG0 X10 Y10\nM3 S1\nG1 X80 Y10 F1200\nG3 X90 Y20 I0 J10\nG1 Y60\nG3 X80 Y70 I-10 J0\nG1 X20\nG3 X10 Y60 I0 J-10\nG1 Y10\nM5\nG0 X60 Y40\nM3 S1\nG3 X60 Y40 I-10 J0 F900\nM5\nG0 X0 Y0\nM30\n";
 
+struct StreamMove {
+    start: Point,
+    target: Point,
+    feed: f64,
+    fraction: f64,
+}
+
+struct JogMove {
+    target: Point,
+    feed: f64,
+}
+
 #[derive(Default)]
 struct Machine {
     file: String,
     files: BTreeMap<String, Vec<u8>>,
     program: Option<Program>,
+    stream: VecDeque<StreamMove>,
     block: usize,
     block_seconds: f64,
     position: Point,
@@ -30,14 +43,17 @@ struct Machine {
     feed: f64,
     rapid: f64,
     complete: bool,
-    jog_until: Option<Instant>,
-    jog_feed: f64,
+    jogs: VecDeque<JogMove>,
+    jog_velocity: f64,
+    jog_cancelling: bool,
+    jog_cancel_count: u64,
     modal: BTreeMap<usize, String>,
     inches: bool,
     modal_inches: bool,
     reboot_banner: bool,
     reject_offsets: bool,
     ignore_offsets: bool,
+    reject_stream: bool,
     disconnect_generation: u64,
     pub commands: Vec<String>,
     report_count: u64,
@@ -48,7 +64,8 @@ struct Machine {
 impl Machine {
     fn velocity(&self) -> f64 {
         match self.state() {
-            "Jog" => self.jog_feed,
+            "Jog" => self.jog_velocity * 60.0,
+            "Run" if !self.stream.is_empty() => self.stream.front().unwrap().feed * self.feed,
             "Run" => self
                 .program
                 .as_ref()
@@ -135,9 +152,9 @@ impl Machine {
             } else {
                 "Hold:0"
             }
-        } else if self.jog_until.is_some_and(|t| t > Instant::now()) {
+        } else if !self.jogs.is_empty() {
             "Jog"
-        } else if self.program.is_some() {
+        } else if self.program.is_some() || !self.stream.is_empty() {
             "Run"
         } else {
             "Idle"
@@ -188,17 +205,32 @@ impl Machine {
         };
         let scale = if self.inches { 25.4 } else { 1.0 };
         format!(
-            "<{}|MPos:{:.4},{:.4},{:.4}{wco}{line}|FS:{:.0},{}{overrides}{file}>\n",
+            "<{}|MPos:{:.4},{:.4},{:.4}{wco}{line}|Bf:{},128|FS:{:.0},{}{overrides}{file}>\n",
             self.state(),
             (self.position.x + self.wco.x) / scale,
             (self.position.y + self.wco.y) / scale,
             (self.position.z + self.wco.z) / scale,
+            16usize.saturating_sub(self.stream.len() + self.jogs.len()),
             self.velocity() / scale,
             if self.torch { 1 } else { 0 },
         )
     }
     fn tick(&mut self, dt: f64) {
         if self.held {
+            return;
+        }
+        if !self.jogs.is_empty() {
+            self.tick_jog(dt);
+            return;
+        }
+        if let Some(motion) = self.stream.front_mut() {
+            let length = motion.start.distance(motion.target);
+            motion.fraction =
+                (motion.fraction + dt * motion.feed * self.feed / 60.0 / length.max(1e-9)).min(1.0);
+            self.position = motion.start.lerp(motion.target, motion.fraction);
+            if motion.fraction >= 1.0 {
+                self.stream.pop_front();
+            }
             return;
         }
         let Some(p) = &self.program else {
@@ -232,6 +264,67 @@ impl Machine {
             self.block_seconds = 0.0;
         }
         self.update_modals(&code);
+    }
+    fn cancel_jog(&mut self) {
+        if !self.jogs.is_empty() {
+            self.jog_cancelling = true;
+            self.jog_cancel_count += 1;
+        }
+    }
+    fn tick_jog(&mut self, dt: f64) {
+        let Some(first) = self.jogs.front() else {
+            return;
+        };
+        let distance = self.position.distance(first.target);
+        if distance < 1e-9 {
+            self.position = first.target;
+            self.jogs.pop_front();
+            if self.jogs.is_empty() {
+                self.jog_velocity = 0.0;
+                self.jog_cancelling = false;
+            }
+            return;
+        }
+        let dx = (first.target.x - self.position.x) / distance;
+        let dy = (first.target.y - self.position.y) / distance;
+        // Match the X/Y acceleration (100 mm/s²) and maximum rate reported by
+        // this simulator. Look ahead through buffered collinear jog packets.
+        let acceleration = 100.0 / dx.abs().max(dy.abs()).max(1e-9);
+        let mut remaining = distance;
+        let mut previous = first.target;
+        for motion in self.jogs.iter().skip(1) {
+            remaining += previous.distance(motion.target);
+            previous = motion.target;
+        }
+        let desired = if self.jog_cancelling {
+            0.0
+        } else {
+            (first.feed / 60.0)
+                .min(50.0 / dx.abs().max(dy.abs()).max(1e-9))
+                .min((2.0 * acceleration * remaining).sqrt())
+        };
+        let next = if desired > self.jog_velocity {
+            (self.jog_velocity + acceleration * dt).min(desired)
+        } else {
+            (self.jog_velocity - acceleration * dt).max(desired)
+        };
+        let mut travel = (self.jog_velocity + next) * 0.5 * dt;
+        self.jog_velocity = next;
+        while let Some(motion) = self.jogs.front() {
+            let distance = self.position.distance(motion.target);
+            if distance > travel + 1e-9 {
+                self.position = self.position.lerp(motion.target, travel / distance);
+                break;
+            }
+            self.position = motion.target;
+            self.jogs.pop_front();
+            travel = (travel - distance).max(0.0);
+        }
+        if self.jogs.is_empty() || self.jog_cancelling && self.jog_velocity <= 1e-9 {
+            self.jogs.clear();
+            self.jog_velocity = 0.0;
+            self.jog_cancelling = false;
+        }
     }
     fn command(&mut self, command: &str) -> String {
         self.commands.push(command.into());
@@ -285,6 +378,29 @@ impl Machine {
                 Err(_) => return "error:20\n".into(),
             }
         }
+        if command.starts_with("G21G90G94G1") {
+            if self.reject_stream {
+                return "error:20\n".into();
+            }
+            if self.program.is_some() || self.held || self.alarm.is_some() {
+                return "error:8\n".into();
+            }
+            let start = self
+                .stream
+                .back()
+                .map_or(self.position, |motion| motion.target);
+            let target = Point {
+                x: word(command, 'X').unwrap_or(start.x),
+                y: word(command, 'Y').unwrap_or(start.y),
+                z: start.z,
+            };
+            self.stream.push_back(StreamMove {
+                start,
+                target,
+                feed: word(command, 'F').unwrap_or(600.0),
+                fraction: 0.0,
+            });
+        }
         if command.starts_with("$J=") {
             if self.program.is_some() || self.held {
                 return "error:8\n".into();
@@ -292,22 +408,35 @@ impl Machine {
             if self.alarm.is_some() {
                 return "error:9\n".into();
             }
-            for axis in ['X', 'Y'] {
-                if let Some(value) = word(command, axis) {
-                    let coordinate = if axis == 'X' {
-                        &mut self.position.x
-                    } else {
-                        &mut self.position.y
-                    };
-                    if command.contains("G90") {
-                        *coordinate = value;
-                    } else {
-                        *coordinate += value;
-                    }
-                }
+            // Enqueue a destination without changing the physical position.
+            // Jog cancellation decelerates along this path, then drops its tail.
+            if self.jog_cancelling {
+                return "ok\n".into();
             }
-            self.jog_until = Some(Instant::now() + Duration::from_millis(140));
-            self.jog_feed = word(command, 'F').unwrap_or(600.0);
+            let start = self
+                .jogs
+                .back()
+                .map_or(self.position, |motion| motion.target);
+            let coordinate = |axis, value| {
+                word(command, axis).map_or(value, |v| {
+                    if command.contains("G90") {
+                        v
+                    } else {
+                        value + v
+                    }
+                })
+            };
+            let target = Point {
+                x: coordinate('X', start.x),
+                y: coordinate('Y', start.y),
+                z: start.z,
+            };
+            if start.distance(target) > 1e-9 {
+                self.jogs.push_back(JogMove {
+                    target,
+                    feed: word(command, 'F').unwrap_or(600.0),
+                });
+            }
         }
         if command == "G21" || command == "G21G54" {
             self.modal_inches = false;
@@ -434,7 +563,10 @@ impl Simulator {
         m.program = None;
         m.torch = false;
         m.held = false;
-        m.jog_until = None;
+        m.jogs.clear();
+        m.jog_velocity = 0.0;
+        m.jog_cancelling = false;
+        m.stream.clear();
         m.report_count = 0;
         if close_connection {
             m.disconnect_generation += 1;
@@ -537,10 +669,14 @@ fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()
                         m.alarm = Some(3);
                     }
                     m.program = None;
+                    m.stream.clear();
                     m.held = false;
                     m.torch = false;
                     m.override_stopped = false;
-                    m.jog_until = None;
+                    m.jogs.clear();
+                    m.jog_velocity = 0.0;
+                    m.jog_cancelling = false;
+                    m.feed = 1.0;
                     m.modal.clear();
                     m.modal_inches = false;
                     line.clear();
@@ -551,9 +687,7 @@ fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()
                         stream.write_all(b"ALARM:3\n")?;
                     }
                 }
-                0x85 => {
-                    m.jog_until = None;
-                }
+                0x85 => m.cancel_jog(),
                 0x90 => m.feed = 1.0,
                 0x91 => m.feed = (m.feed + 0.1).min(2.0),
                 0x92 => m.feed = (m.feed - 0.1).max(0.1),
@@ -620,7 +754,7 @@ fn http_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()> 
     let path = parts.next().unwrap_or("");
     let mut m = state.lock().unwrap();
     let (code, content, body) = if path == "/sim/status" {
-        (200,"application/json",serde_json::to_vec(&json!({"state":m.state(),"x":m.position.x,"y":m.position.y,"mpos_x":m.position.x+m.wco.x,"mpos_y":m.position.y+m.wco.y,"torch":m.torch,"feed_override":m.feed,"alarm":m.alarm,"commands":m.commands,"file":m.file})).unwrap())
+        (200,"application/json",serde_json::to_vec(&json!({"state":m.state(),"x":m.position.x,"y":m.position.y,"mpos_x":m.position.x+m.wco.x,"mpos_y":m.position.y+m.wco.y,"torch":m.torch,"feed_override":m.feed,"velocity":m.velocity(),"jog_cancel_count":m.jog_cancel_count,"jog_queued":m.jogs.len(),"jog_cancelling":m.jog_cancelling,"alarm":m.alarm,"commands":m.commands,"file":m.file})).unwrap())
     } else if path == "/sim/disconnect" && method == "POST" {
         m.disconnect_generation += 1;
         (200, "application/json", b"{}".to_vec())
@@ -704,6 +838,94 @@ mod tests {
         controller::{Action, Controller, Snapshot},
         protocol,
     };
+    #[test]
+    fn simulated_jog_cancel_brakes_immediately_and_discards_the_distant_target() {
+        let mut machine = Machine {
+            feed: 1.9,
+            ..Default::default()
+        };
+        machine.command("$J=G21G90X100Y0F600");
+        assert_eq!(
+            machine.position.x, 0.0,
+            "Accepting a jog must not teleport the head"
+        );
+        for _ in 0..100 {
+            machine.tick(0.002);
+        }
+        assert!((machine.jog_velocity - 10.0).abs() < 1e-9);
+        let released = machine.position.x;
+        machine.cancel_jog();
+        machine.tick(0.002);
+        assert!(
+            machine.jog_velocity < 10.0,
+            "The first tick after cancel must decelerate"
+        );
+        for _ in 0..100 {
+            machine.tick(0.002);
+        }
+        assert_eq!(machine.state(), "Idle");
+        assert!(machine.jogs.is_empty());
+        assert!((machine.position.x - released - 0.5).abs() < 0.01);
+        let stopped = machine.position;
+        for _ in 0..500 {
+            machine.tick(0.002);
+        }
+        assert_eq!(machine.position, stopped);
+    }
+
+    #[test]
+    fn held_release_stops_a_large_increment_without_resuming_it() {
+        for speed in [600.0, 2400.0] {
+            let sim = Simulator::start().unwrap();
+            let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
+            wait(&controller, |s| s.initialized && s.can_jog());
+            controller.send(Action::JogInput {
+                directions: [1, 0],
+                presses: [1, 0],
+                speed,
+                step: 100.0,
+            });
+            let holding = Instant::now();
+            while holding.elapsed() < Duration::from_millis(450) {
+                controller.send(Action::JogInput {
+                    directions: [1, 0],
+                    presses: [0, 0],
+                    speed,
+                    step: 100.0,
+                });
+                thread::sleep(Duration::from_millis(20));
+            }
+            let (position, before_cancel) = {
+                let m = sim.machine.lock().unwrap();
+                (m.position, m.jog_cancel_count)
+            };
+            let released = Instant::now();
+            controller.send(Action::JogInput {
+                directions: [0, 0],
+                presses: [0, 0],
+                speed,
+                step: 100.0,
+            });
+            while sim.machine.lock().unwrap().jog_cancel_count == before_cancel {
+                assert!(
+                    released.elapsed() < Duration::from_millis(200),
+                    "Release did not send immediate cancel"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            wait(&controller, |s| s.status.idle() && !s.jog_restarting);
+            assert!(released.elapsed() < Duration::from_secs(1));
+            let stopped = sim.machine.lock().unwrap().position;
+            let velocity = speed / 60.0;
+            assert!(stopped.x - position.x < velocity * velocity / 200.0 + velocity * 0.2 + 0.1);
+            thread::sleep(Duration::from_millis(300));
+            let machine = sim.machine.lock().unwrap();
+            assert_eq!(machine.position, stopped);
+            assert_eq!(machine.state(), "Idle");
+            assert!(machine.jogs.is_empty());
+        }
+    }
+
     #[test]
     fn readouts_follow_auto_modal_reports_and_realtime_feed() {
         let sim = Simulator::start().unwrap();
@@ -1096,7 +1318,9 @@ mod tests {
             y: 0.0,
             speed: 600.0,
         });
-        wait(&controller, |s| s.status.state == "Jog");
+        wait(&controller, |s| {
+            s.status.state == "Jog" && s.status.wpos.x > 0.001
+        });
         controller.send(Action::CancelJog);
         let before = wait(&controller, |s| s.status.idle());
         assert!(before.status.wpos.x > 0.0);
@@ -1314,7 +1538,7 @@ mod tests {
             x: 1.0,
             y: 0.0,
             speed: 600.0,
-            step: 100.0,
+            step: 20.0,
         });
         controller.send(Action::FinishJog);
         wait(&controller, |s| s.status.state == "Jog");
@@ -1333,9 +1557,7 @@ mod tests {
                 .any(|cmd| cmd.starts_with("$J=") && cmd.ends_with("F600.0"))
         });
         let done = wait(&controller, |s| {
-            s.status.idle()
-                && !s.jog_restarting
-                && (s.status.wpos.x - start.x - 100.0).abs() < 0.001
+            s.status.idle() && !s.jog_restarting && (s.status.wpos.x - start.x - 20.0).abs() < 0.001
         });
         assert!((done.status.feed_override - 1.1).abs() < 0.001);
         assert!(!done.status.torch && done.alarm.is_none());
@@ -1373,23 +1595,33 @@ mod tests {
         });
         wait(&controller, |s| s.can_run());
         let start = controller.snapshot().status.wpos;
-        controller.send(Action::TraceHull { speed: 777.0 });
+        controller.send(Action::TraceHull {
+            speed: 777.0,
+            boosted: false,
+        });
         let tracing = wait(&controller, |s| s.tracing);
         assert!(!tracing.can_run() && !tracing.can_jog());
-        let done = wait(&controller, |s| s.phase == "Hull trace complete");
+        let done = wait(&controller, |s| s.phase.starts_with("Hull trace complete"));
         assert!(!done.status.torch);
         assert!(done.status.wpos.distance(start) < 0.001);
         let commands = sim.commands();
-        let jogs: Vec<_> = commands.iter().filter(|c| c.starts_with("$J=")).collect();
-        assert!(jogs.len() > 6); // Short queued segments visit every vertex, close, return.
-        for command in &jogs {
-            assert!(command.starts_with("$J=G21G90X") && command.ends_with("F777.0"));
+        let moves: Vec<_> = commands
+            .iter()
+            .filter(|c| c.starts_with("G21G90G94G1"))
+            .collect();
+        assert!(moves.len() >= 5);
+        for command in &moves {
+            assert!(command.ends_with("F3108.0"));
             assert!(!command.contains('Z') && !command.contains("M3"));
         }
-        assert!(jogs.iter().any(|c| c.contains("X10.00000Y10.00000")));
+        assert!(moves.iter().any(|c| c.contains("X10.00000Y10.00000")));
+        assert!(!commands.iter().any(|c| c.starts_with("$J=")));
         assert!(!commands.iter().any(|c| c.starts_with("$LocalFS/Run=")));
-        controller.send(Action::TraceHull { speed: 600.0 });
-        wait(&controller, |s| s.tracing && s.status.state == "Jog");
+        controller.send(Action::TraceHull {
+            speed: 600.0,
+            boosted: false,
+        });
+        wait(&controller, |s| s.tracing && s.status.state == "Run");
         controller.send(Action::CancelTrace);
         wait(&controller, |s| !s.tracing && s.status.idle());
         let count = sim.commands().len();
@@ -1400,6 +1632,185 @@ mod tests {
             "Trace must not resume after cancellation"
         );
     }
+    #[test]
+    fn trace_shift_updates_queued_g1_motion_and_restores_exact_user_override_on_cancel() {
+        let sim = Simulator::start().unwrap();
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
+        wait(&controller, |s| s.initialized && s.status.position_known);
+        for byte in [0x91, 0x91, 0x91, 0x93, 0x93, 0x93] {
+            controller.send(Action::Feed(byte));
+        }
+        wait(&controller, |s| {
+            (s.status.feed_override - 1.33).abs() < 0.001
+        });
+        controller.send(Action::Load {
+            name: "trace.nc".into(),
+            text: "G21G90\nG1X100Y0F600\nY100\nX0\nY0".into(),
+        });
+        wait(&controller, |s| s.can_run());
+        controller.send(Action::TraceHull {
+            speed: 600.0,
+            boosted: false,
+        });
+        wait(&controller, |s| {
+            s.tracing && s.status.state == "Run" && s.status.feed == 600.0
+        });
+        controller.send(Action::TraceSpeed { boosted: true });
+        let fast = wait(&controller, |s| s.status.feed == 2400.0);
+        assert_eq!(fast.status.feed_override, 1.0);
+        controller.send(Action::TraceSpeed { boosted: false });
+        let slow = wait(&controller, |s| s.status.feed == 600.0);
+        assert_eq!(slow.status.feed_override, 0.25);
+        assert!(!slow.console.iter().any(|s| s.contains("cancel jog")
+            || s.contains("soft reset")
+            || s.contains("feed hold")));
+        assert!(!sim.commands().iter().any(|c| c.starts_with("$J=")));
+        controller.send(Action::CancelTrace);
+        let restored = wait(&controller, |s| {
+            !s.tracing && s.initialized && s.status.idle()
+        });
+        assert!((restored.status.feed_override - 1.33).abs() < 0.001);
+        assert!(restored.alarm.is_none());
+        let machine = sim.machine.lock().unwrap();
+        assert!(machine.stream.is_empty());
+        assert!(!machine.torch);
+    }
+
+    #[test]
+    fn trace_completion_restores_modal_units_distance_and_feed_override() {
+        let sim = Simulator::start().unwrap();
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
+        wait(&controller, |s| s.initialized && s.status.position_known);
+        controller.send(Action::Console("G20G91G1F12".into()));
+        wait(&controller, |s| {
+            !s.options.initial_mm && !s.options.initial_absolute
+        });
+        controller.send(Action::Feed(0x92));
+        wait(&controller, |s| {
+            (s.status.feed_override - 0.9).abs() < 0.001
+        });
+        controller.send(Action::Load {
+            name: "tiny.nc".into(),
+            text: "G21G90\nG1X1Y0F600\nY1\nX0\nY0".into(),
+        });
+        wait(&controller, |s| s.can_run());
+        controller.send(Action::TraceHull {
+            speed: 600.0,
+            boosted: true,
+        });
+        let done = wait(&controller, |s| {
+            s.phase.starts_with("Hull trace complete") && !s.tracing
+        });
+        assert!((done.status.feed_override - 0.9).abs() < 0.001);
+        assert!(!done.options.initial_mm && !done.options.initial_absolute);
+        assert!((done.options.initial_feed - 304.8).abs() < 0.001);
+        assert!(done.status.wpos.distance(Point::default()) < 0.001);
+    }
+
+    #[test]
+    fn closing_during_a_trace_stops_motion_and_restores_override() {
+        let sim = Simulator::start().unwrap();
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
+        wait(&controller, |s| s.initialized && s.status.position_known);
+        controller.send(Action::Feed(0x91));
+        wait(&controller, |s| {
+            (s.status.feed_override - 1.1).abs() < 0.001
+        });
+        controller.send(Action::Load {
+            name: "long.nc".into(),
+            text: "G21G90\nG1X100Y0F600\nY100\nX0\nY0".into(),
+        });
+        wait(&controller, |s| s.can_run());
+        controller.send(Action::TraceHull {
+            speed: 600.0,
+            boosted: false,
+        });
+        wait(&controller, |s| s.tracing && s.status.state == "Run");
+        drop(controller);
+        let machine = sim.machine.lock().unwrap();
+        assert_eq!(machine.state(), "Idle");
+        assert!((machine.feed - 1.1).abs() < 0.001);
+        assert!(machine.alarm.is_none() && machine.stream.is_empty());
+    }
+
+    #[test]
+    fn app_restart_recovers_a_borrowed_override_and_never_replays_the_trace() {
+        let sim = Simulator::start().unwrap();
+        let scratch = CheckpointFile::new();
+        let recovery_path = scratch.0.with_file_name("trace-restore.json");
+        let mut recovery = crate::trace::TraceRecovery::load(recovery_path.clone()).unwrap();
+        recovery
+            .begin(
+                &sim.address,
+                crate::trace::SavedTrace {
+                    feed: 143,
+                    modal: "G21G90G94G0F60".into(),
+                },
+            )
+            .unwrap();
+        {
+            let mut machine = sim.machine.lock().unwrap();
+            machine.feed = 0.25;
+            machine.command("G21G90G94G1X100Y0F2400");
+        }
+        let before = sim.commands().len();
+        let controller = scratch.start(&sim);
+        let done = wait(&controller, |s| {
+            s.initialized && s.status.idle() && !s.tracing
+        });
+        assert!((done.status.feed_override - 1.43).abs() < 0.001);
+        assert!(
+            !sim.commands()[before..]
+                .iter()
+                .any(|c| c.starts_with("G21G90G94G1"))
+        );
+        assert!(
+            crate::trace::TraceRecovery::load(recovery_path)
+                .unwrap()
+                .get(&sim.address)
+                .is_none()
+        );
+        assert!(sim.machine.lock().unwrap().stream.is_empty());
+    }
+
+    #[test]
+    fn trace_rejection_and_alarm_restore_the_override_without_claiming_completion() {
+        for alarm in [false, true] {
+            let sim = Simulator::start().unwrap();
+            let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
+            wait(&controller, |s| s.initialized && s.status.position_known);
+            controller.send(Action::Feed(0x91));
+            wait(&controller, |s| {
+                (s.status.feed_override - 1.1).abs() < 0.001
+            });
+            controller.send(Action::Load {
+                name: "long.nc".into(),
+                text: "G21G90\nG1X100Y0F600\nY100\nX0\nY0".into(),
+            });
+            wait(&controller, |s| s.can_run());
+            if !alarm {
+                sim.machine.lock().unwrap().reject_stream = true;
+            }
+            controller.send(Action::TraceHull {
+                speed: 600.0,
+                boosted: false,
+            });
+            if alarm {
+                wait(&controller, |s| s.tracing && s.status.state == "Run");
+                let mut machine = sim.machine.lock().unwrap();
+                machine.alarm = Some(1);
+                machine.stream.clear();
+            }
+            let done = wait(&controller, |s| {
+                !s.tracing
+                    && (s.status.feed_override - 1.1).abs() < 0.001
+                    && (s.error.is_some() || s.phase.contains("alarm"))
+            });
+            assert!(!done.phase.starts_with("Hull trace complete"));
+            assert!(sim.machine.lock().unwrap().stream.is_empty());
+        }
+    }
+
     #[test]
     fn console_is_separate_and_updates_dro_and_override_promptly() {
         let sim = Simulator::start().unwrap();
@@ -1477,31 +1888,39 @@ mod tests {
         wait(&controller, |s| s.can_run());
         sim.machine.lock().unwrap().torch = true;
         wait(&controller, |s| s.status.torch);
-        controller.send(Action::TraceHull { speed: 600.0 });
+        controller.send(Action::TraceHull {
+            speed: 600.0,
+            boosted: false,
+        });
         let rejected = wait(&controller, |s| {
             s.error.as_ref().is_some_and(|e| e.contains("torch off"))
         });
         assert!(!rejected.tracing);
-        assert!(!sim.commands().iter().any(|c| c.starts_with("$J=")));
+        assert!(!sim.commands().iter().any(|c| c.starts_with("G21G90G94G1")));
         sim.machine.lock().unwrap().torch = false;
         wait(&controller, |s| !s.status.torch);
-        controller.send(Action::TraceHull { speed: 600.0 });
-        wait(&controller, |s| s.tracing && s.status.state == "Jog");
+        controller.send(Action::TraceHull {
+            speed: 600.0,
+            boosted: false,
+        });
+        wait(&controller, |s| s.tracing && s.status.state == "Run");
         sim.disconnect();
         let disconnected = wait(&controller, |s| !s.connected);
         assert!(!disconnected.tracing);
         let count = sim
             .commands()
             .iter()
-            .filter(|c| c.starts_with("$J="))
+            .filter(|c| c.starts_with("G21G90G94G1"))
             .count();
-        let reconnected = wait(&controller, |s| s.initialized && s.status.idle());
+        let reconnected = wait(&controller, |s| {
+            s.initialized && s.status.idle() && !s.tracing
+        });
         assert!(!reconnected.tracing);
         assert_eq!(
             count,
             sim.commands()
                 .iter()
-                .filter(|c| c.starts_with("$J="))
+                .filter(|c| c.starts_with("G21G90G94G1"))
                 .count()
         );
     }

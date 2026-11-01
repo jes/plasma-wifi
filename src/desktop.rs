@@ -10,7 +10,7 @@ use std::{
 use x11rb::{
     COPY_DEPTH_FROM_PARENT,
     connection::{Connection, RequestConnection},
-    protocol::{Event, xproto::*},
+    protocol::{Event, xkb, xproto::*},
     wrapper::ConnectionExt as _,
 };
 
@@ -24,6 +24,23 @@ pub fn set_ui_scale(ctx: &egui::Context, scale: f32) {
 pub fn run(mut draw: impl FnMut(&mut egui::Ui)) -> Result<()> {
     let (conn, screen_id) = x11rb::connect(None)
         .context("Cannot connect to X11. Run from an X11 desktop or enable XWayland.")?;
+    // Ask this client to receive repeated presses without synthetic releases.
+    // Otherwise egui can turn X11 autorepeat into new discrete jog taps.
+    if let Ok(cookie) = xkb::use_extension(&conn, 1, 0)
+        && let Ok(reply) = cookie.reply()
+        && reply.supported
+        && let Ok(cookie) = xkb::per_client_flags(
+            &conn,
+            xkb::ID::USE_CORE_KBD.into(),
+            xkb::PerClientFlag::DETECTABLE_AUTO_REPEAT,
+            xkb::PerClientFlag::DETECTABLE_AUTO_REPEAT,
+            0u32.into(),
+            0u32.into(),
+            0u32.into(),
+        )
+    {
+        let _ = cookie.reply();
+    }
     let screen = &conn.setup().roots[screen_id];
     let format = conn
         .setup()
@@ -251,6 +268,9 @@ pub fn run(mut draw: impl FnMut(&mut egui::Ui)) -> Result<()> {
                             // pair with the same timestamp. Detect that pair as
                             // well as servers that emit repeated presses alone.
                             let paired_repeat = last_key_release == Some((e.detail, e.time));
+                            if paired_repeat {
+                                remove_repeat_release(&mut input.events, key);
+                            }
                             last_key_release = None;
                             !pressed.insert(key) || paired_repeat
                         } else {
@@ -404,6 +424,17 @@ pub fn run(mut draw: impl FnMut(&mut egui::Ui)) -> Result<()> {
     Ok(())
 }
 
+// Fallback for X servers that do not support detectable autorepeat. Keep a
+// release/press pair in the same frame from resetting egui's held-key state.
+fn remove_repeat_release(events: &mut Vec<InputEvent>, key: Key) {
+    if let Some(index) = events.iter().rposition(|event| {
+        matches!(event,
+        InputEvent::Key { key: released, pressed: false, .. } if *released == key)
+    }) {
+        events.remove(index);
+    }
+}
+
 fn window_icon(size: u32) -> Vec<u32> {
     let mut out = vec![size, size];
     let bolt = [
@@ -493,4 +524,59 @@ fn key(symbol: u32) -> Option<Key> {
             };
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn event(pressed: bool, repeat: bool) -> InputEvent {
+        InputEvent::Key {
+            key: Key::ArrowRight,
+            physical_key: Some(Key::ArrowRight),
+            pressed,
+            repeat,
+            modifiers: Modifiers::NONE,
+        }
+    }
+    #[test]
+    fn x11_repeat_pairs_do_not_become_new_taps_and_real_release_is_immediate() {
+        let ctx = egui::Context::default();
+        let frame = |events: Vec<InputEvent>| {
+            let mut result = None;
+            let _ = ctx.run_ui(
+                RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    result = Some(ui.input(|i| {
+                        (
+                            i.key_down(Key::ArrowRight),
+                            i.events
+                                .iter()
+                                .filter(|event| {
+                                    matches!(
+                                        event,
+                                        InputEvent::Key {
+                                            key: Key::ArrowRight,
+                                            pressed: true,
+                                            repeat: false,
+                                            ..
+                                        }
+                                    )
+                                })
+                                .count(),
+                        )
+                    }));
+                },
+            );
+            result.unwrap()
+        };
+        assert_eq!(frame(vec![event(true, false)]), (true, 1));
+        let mut repeat = vec![event(false, false)];
+        remove_repeat_release(&mut repeat, Key::ArrowRight);
+        repeat.push(event(true, true));
+        assert_eq!(frame(repeat), (true, 0));
+        assert_eq!(frame(vec![event(false, false)]), (false, 0));
+    }
 }

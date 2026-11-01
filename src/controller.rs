@@ -1,7 +1,9 @@
 use crate::{
     coordinates::Coordinates,
     gcode::{self, ParseOptions, Point, Program, TimeParts},
+    jog::ManualJog,
     protocol::{self, Link, Status},
+    trace::{RestorePhase, SavedTrace, Trace, TraceRecovery, TraceRestore},
 };
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -38,18 +40,35 @@ pub enum Action {
     },
     TraceHull {
         speed: f64,
+        boosted: bool,
+    },
+    TraceSpeed {
+        boosted: bool,
     },
     JogSpeed {
         speed: f64,
     },
     CancelTrace,
     Feed(u8),
+    #[cfg(test)]
     Jog {
         x: f64,
         y: f64,
         speed: f64,
         step: f64,
     },
+    JogInput {
+        directions: [i8; 2],
+        presses: [i32; 2],
+        speed: f64,
+        step: f64,
+    },
+    JogTo {
+        x: f64,
+        y: f64,
+        speed: f64,
+    },
+    #[cfg(test)]
     FinishJog,
     CancelJog,
     SetCoordinate {
@@ -248,12 +267,14 @@ impl Snapshot {
 struct QueuedCommand {
     text: String,
     manual: bool,
+    trace: bool,
 }
 impl From<String> for QueuedCommand {
     fn from(text: String) -> Self {
         Self {
             text,
             manual: false,
+            trace: false,
         }
     }
 }
@@ -279,62 +300,6 @@ impl PartialEq<&str> for QueuedCommand {
     }
 }
 
-struct Trace {
-    points: Vec<Point>,
-    next: usize,
-    sent: Option<Instant>,
-    speed: f64,
-    active_speed: f64,
-    cursor: Point,
-    buffered: VecDeque<TracePoint>,
-}
-#[derive(Clone, Copy)]
-struct TracePoint {
-    point: Point,
-    target: usize,
-}
-impl Trace {
-    fn buffered_distance(&mut self, current: Point) -> f64 {
-        // Measure travel along the queued polyline, including corners. The
-        // straight-line distance to the cursor collapses near a closed loop
-        // and would allow excessive travel to be buffered.
-        let mut closest = (f64::INFINITY, 0, self.buffered[0]);
-        for i in 0..self.buffered.len().saturating_sub(1) {
-            let a = self.buffered[i].point;
-            let b = self.buffered[i + 1].point;
-            let length = a.distance(b);
-            let fraction = if length < 1e-12 {
-                0.0
-            } else {
-                (((current.x - a.x) * (b.x - a.x) + (current.y - a.y) * (b.y - a.y))
-                    / length.powi(2))
-                .clamp(0.0, 1.0)
-            };
-            let point = a.lerp(b, fraction);
-            let error = current.distance(point);
-            if error + 1e-9 < closest.0 {
-                closest = (
-                    error,
-                    i,
-                    TracePoint {
-                        point,
-                        target: self.buffered[i + 1].target,
-                    },
-                );
-            }
-        }
-        self.buffered.drain(..closest.1);
-        self.buffered[0] = closest.2;
-        current.distance(self.buffered[0].point)
-            + self
-                .buffered
-                .iter()
-                .zip(self.buffered.iter().skip(1))
-                .map(|(a, b)| a.point.distance(b.point))
-                .sum::<f64>()
-    }
-}
-
 struct JogLookahead {
     refill: f64,
     segment: f64,
@@ -344,22 +309,6 @@ struct JogRestart {
     started: Instant,
     fence: Option<Instant>,
     polled: Instant,
-}
-
-struct ManualJog {
-    x: f64,
-    y: f64,
-    speed: f64,
-    active_speed: f64,
-    cursor: Point,
-    step: f64,
-    target: Point,
-    origin: Point,
-    heartbeat: Instant,
-    extended: Instant,
-    sent: bool,
-    sent_at: Option<Instant>,
-    released: bool,
 }
 
 pub struct Controller {
@@ -376,6 +325,21 @@ impl Controller {
         let handle = thread::spawn(move || {
             let mut worker = Worker::new(address, http, rx, state);
             if let Some(path) = coordinates_path {
+                match TraceRecovery::load(path.with_file_name("trace-restore.json")) {
+                    Ok(recovery) => {
+                        if let Some(saved) = recovery.get(&worker.address) {
+                            worker.trace_restore = Some(TraceRestore::interrupted(saved));
+                            worker.s.tracing = true;
+                            worker.cancel_trace_on_connect = true;
+                        }
+                        worker.trace_recovery = recovery;
+                    }
+                    Err(e) => {
+                        worker.fail(format!("Cannot read trace recovery state: {e:#}"));
+                        *worker.shared.lock().unwrap() = worker.s.clone();
+                        return;
+                    }
+                }
                 match Coordinates::load(path) {
                     Ok(coordinates) => worker.coordinates = coordinates,
                     Err(e) => worker.fail(format!("Cannot load saved coordinates: {e:#}")),
@@ -554,6 +518,8 @@ struct Worker {
     auto_reports: bool,
     stopping: Option<Instant>,
     trace: Option<Trace>,
+    trace_restore: Option<TraceRestore>,
+    trace_recovery: TraceRecovery,
     cancel_trace_on_connect: bool,
     coordinates: Coordinates,
     coordinate_recovery: CoordinateRecovery,
@@ -604,6 +570,8 @@ impl Worker {
             auto_reports: false,
             stopping: None,
             trace: None,
+            trace_restore: None,
+            trace_recovery: TraceRecovery::default(),
             cancel_trace_on_connect: false,
             coordinates: Coordinates::default(),
             coordinate_recovery: CoordinateRecovery::Pending,
@@ -612,6 +580,7 @@ impl Worker {
         }
     }
     fn run(mut self) {
+        let mut shutdown: Option<Instant> = None;
         loop {
             let now = Instant::now();
             let dt = now.duration_since(self.last_tick).as_secs_f64();
@@ -640,12 +609,15 @@ impl Worker {
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        let _ = self.realtime(&[protocol::JOG_CANCEL]);
-                        self.checkpoint_coordinates();
-                        if let Err(e) = self.coordinates.flush() {
-                            eprintln!("Cannot save coordinates: {e:#}");
+                        if shutdown.is_none() {
+                            shutdown = Some(Instant::now());
+                            if self.trace.is_some() {
+                                let _ = self.action(Action::CancelTrace);
+                            } else {
+                                let _ = self.action(Action::CancelJog);
+                            }
                         }
-                        return;
+                        break;
                     }
                 }
             }
@@ -655,10 +627,12 @@ impl Worker {
                     Ok(link) => {
                         self.link = Some(link);
                         if self.cancel_trace_on_connect {
-                            let _ = self.realtime(&[protocol::JOG_CANCEL]);
+                            let _ = self.realtime(&[protocol::HOLD]);
+                            self.stopping = Some(Instant::now());
                             self.cancel_trace_on_connect = false;
                         }
                         self.s.connected = true;
+                        self.s.tracing = self.trace_restore.is_some();
                         self.s.status = Status::default();
                         self.s.status.state = "Connecting".into();
                         self.s.modal.clear();
@@ -696,6 +670,9 @@ impl Worker {
             if let Err(e) = self.advance_jog_restart() {
                 self.fail(format!("{e:#}"));
             }
+            if let Err(e) = self.advance_trace_restore() {
+                self.fail(format!("{e:#}"));
+            }
             if let Err(e) = self.advance_trace() {
                 self.fail(format!("{e:#}"));
             }
@@ -715,6 +692,17 @@ impl Worker {
                     self.s.coefficient,
                 );
             }
+            if shutdown.is_some_and(|at| {
+                self.trace_restore.is_none() && self.stopping.is_none()
+                    || self.link.is_none()
+                    || at.elapsed() > Duration::from_secs(8)
+            }) {
+                self.checkpoint_coordinates();
+                if let Err(e) = self.coordinates.flush() {
+                    eprintln!("Cannot save coordinates: {e:#}");
+                }
+                return;
+            }
             *self.shared.lock().unwrap() = self.s.clone();
             thread::sleep(Duration::from_millis(10));
         }
@@ -727,8 +715,13 @@ impl Worker {
         if self.s.connected && self.s.job {
             self.lost_at = Some((Instant::now(), self.s.status.state == "Run"));
         }
-        if self.s.tracing {
-            let _ = self.realtime(&[protocol::JOG_CANCEL]);
+        if self.trace_restore.is_some() {
+            self.trace = None;
+            if let Some(restore) = &mut self.trace_restore {
+                restore.phase = RestorePhase::WaitingReset;
+                restore.outcome = "Hull trace cancelled by disconnection".into();
+            }
+            let _ = self.realtime(&[protocol::HOLD]);
             self.cancel_trace_on_connect = true;
             self.s
                 .log("Hull trace cancelled by disconnection; it will not restart");
@@ -826,7 +819,10 @@ impl Worker {
             anyhow::bail!("Controller handshake timed out");
         }
         if self.pending.as_ref().is_some_and(|(cmd, t)| {
-            !cmd.manual && !cmd.starts_with("$LocalFS/Run=") && t.elapsed() > Duration::from_secs(5)
+            !cmd.manual
+                && !cmd.trace
+                && !cmd.starts_with("$LocalFS/Run=")
+                && t.elapsed() > Duration::from_secs(5)
         }) {
             anyhow::bail!("Controller command timed out; it will not be repeated");
         }
@@ -1020,12 +1016,6 @@ impl Worker {
             if self.s.status.position_known {
                 self.s.options.start = self.s.status.wpos;
                 self.s.options.wco = self.s.status.wco;
-                if let Some(trace) = &mut self.trace {
-                    trace.buffered_distance(Point {
-                        z: 0.0,
-                        ..self.s.status.wpos
-                    });
-                }
             }
             if self.s.status.state.starts_with("Hold")
                 && matches!(self.pause, PauseState::None)
@@ -1066,10 +1056,16 @@ impl Worker {
                 || self.got_units)
         {
             self.trace = None;
+            if let Some(restore) = &mut self.trace_restore {
+                if matches!(restore.phase, RestorePhase::Tracing) {
+                    restore.outcome = "Hull trace interrupted by controller reset".into();
+                }
+                restore.phase = RestorePhase::WaitingIdle;
+            }
             self.jog = None;
             self.jog_restart = None;
             self.s.jog_restarting = false;
-            self.s.tracing = false;
+            self.s.tracing = self.trace_restore.is_some();
             self.stopping = None;
             self.reset_wait = None;
             self.s.ready = false;
@@ -1186,15 +1182,22 @@ impl Worker {
                     self.jog_ack_delay =
                         (self.jog_ack_delay * 0.9).max(sent.elapsed().as_secs_f64());
                 }
-                if let Some(trace) = &mut self.trace {
-                    trace.sent = Some(Instant::now());
-                }
+
                 if let Some(jog) = &mut self.jog {
                     jog.sent_at = Some(Instant::now());
                 }
             }
+            if cmd.trace
+                && line == "ok"
+                && let Some(trace) = &mut self.trace
+            {
+                trace.sent = Some(Instant::now());
+            }
             if line.starts_with("error:") {
                 self.fail(format!("{cmd}: {line}"));
+                if cmd.trace {
+                    self.action(Action::Stop)?;
+                }
                 if matches!(self.coordinate_recovery, CoordinateRecovery::Writing)
                     || (!self.s.initialized && cmd == "G54")
                 {
@@ -1206,11 +1209,6 @@ impl Worker {
                 if cmd.starts_with("$LocalFS/Run=") {
                     self.realtime(&[protocol::RESET])?;
                     self.s.job = false;
-                }
-                if cmd.starts_with("$J=") && self.s.tracing {
-                    self.trace = None;
-                    self.s.tracing = false;
-                    self.s.phase = "Hull trace failed".into();
                 }
                 if cmd.starts_with("$J=") {
                     self.jog = None;
@@ -1253,19 +1251,22 @@ impl Worker {
             }
         }
         if line.starts_with("ALARM:") {
-            if self
-                .pending
-                .as_ref()
-                .is_some_and(|(cmd, _)| cmd.starts_with("$LocalFS/Run=") || cmd.starts_with("$J="))
-            {
+            if self.pending.as_ref().is_some_and(|(cmd, _)| {
+                cmd.starts_with("$LocalFS/Run=") || cmd.starts_with("$J=") || cmd.trace
+            }) {
                 self.pending = None;
             }
             self.trace = None;
+            if let Some(restore) = &mut self.trace_restore {
+                restore.phase = RestorePhase::WaitingIdle;
+                restore.outcome = "Hull trace stopped by alarm".into();
+            }
             self.jog = None;
             self.jog_restart = None;
             self.s.jog_restarting = false;
-            self.s.tracing = false;
-            self.queue.retain(|cmd| !cmd.starts_with("$J="));
+            self.s.tracing = self.trace_restore.is_some();
+            self.queue
+                .retain(|cmd| !cmd.starts_with("$J=") && !cmd.trace);
             self.s.alarm = Some(line.into());
             self.s.status.state = "Alarm".into();
             self.s.job = false;
@@ -1460,9 +1461,13 @@ impl Worker {
                     self.reset_controller()?;
                     return Ok(());
                 }
-                let jogging = self.s.tracing || self.jog.is_some() || self.s.status.state == "Jog";
+                if let Some(restore) = &mut self.trace_restore {
+                    restore.phase = RestorePhase::WaitingReset;
+                    restore.outcome = "Hull trace cancelled".into();
+                }
+                let jogging = self.jog.is_some() || self.s.status.state == "Jog";
                 self.trace = None;
-                self.s.tracing = false;
+                self.s.tracing = self.trace_restore.is_some();
                 self.jog = None;
                 self.jog_restart = None;
                 self.s.jog_restarting = false;
@@ -1495,6 +1500,10 @@ impl Worker {
             }
             Action::Feed(byte) => {
                 ensure!(
+                    !self.s.tracing,
+                    "Hull tracing is temporarily using feed override"
+                );
+                ensure!(
                     [0x90, 0x91, 0x92, 0x93, 0x94].contains(&byte),
                     "Invalid override"
                 );
@@ -1502,85 +1511,60 @@ impl Worker {
                 self.realtime(b"?")?;
                 self.poll = Instant::now();
             }
+            #[cfg(test)]
             Action::Jog { x, y, speed, step } => {
                 ensure!(
-                    self.s.can_jog() && !self.s.status.torch,
-                    "Jogging requires an idle machine and torch off"
+                    x.is_finite() && y.is_finite() && (x != 0.0 || y != 0.0),
+                    "Invalid jog direction"
+                );
+                let directions = [
+                    if x == 0.0 { 0 } else { x.signum() as i8 },
+                    if y == 0.0 { 0 } else { y.signum() as i8 },
+                ];
+                let previous = self.jog.as_ref().map_or([0, 0], ManualJog::directions);
+                let presses = std::array::from_fn(|i| {
+                    if directions[i] != previous[i] {
+                        i32::from(directions[i])
+                    } else {
+                        0
+                    }
+                });
+                self.jog_input(directions, presses, speed, step)?;
+            }
+            Action::JogInput {
+                directions,
+                presses,
+                speed,
+                step,
+            } => {
+                self.jog_input(directions, presses, speed, step)?;
+            }
+            Action::JogTo { x, y, speed } => {
+                ensure!(
+                    self.s.can_jog() && !self.s.status.torch && x.is_finite() && y.is_finite(),
+                    "Jog to position requires an idle machine and finite coordinates"
                 );
                 ensure!(
-                    speed.is_finite()
-                        && (1.0..=3000.0).contains(&speed)
-                        && x.is_finite()
-                        && y.is_finite()
-                        && (x != 0.0 || y != 0.0)
-                        && step.is_finite()
-                        && (0.001..=100.0).contains(&step),
-                    "Invalid jog speed, direction or increment"
+                    speed.is_finite() && (1.0..=3000.0).contains(&speed),
+                    "Invalid jog speed"
                 );
-                let length = x.hypot(y);
-                let (x, y) = (x / length, y / length);
-                // A newly pressed tap follows an already dispatched tap without
-                // cancelling its increment. Keep the completed packet's state
-                // until then so Shift can also change a released move's speed.
-                if self
-                    .jog
-                    .as_ref()
-                    .is_some_and(|jog| jog.released && jog.cursor.distance(jog.target) < 1e-9)
-                    && self.jog_restart.is_none()
-                {
-                    self.jog = None;
-                }
-                if let Some(jog) = &mut self.jog
-                    && (jog.x, jog.y, jog.step) == (x, y, step)
-                {
-                    jog.heartbeat = Instant::now();
-                    jog.released = false;
-                    self.change_jog_speed(speed)?;
-                    return Ok(());
-                }
-                let cancelled = self.jog.is_some();
-                if cancelled {
-                    self.action(Action::CancelJog)?;
-                }
-                self.jog = Some(ManualJog {
+                let was_sent = self.jog.as_ref().is_some_and(|jog| jog.sent);
+                let mut jog = ManualJog::new(self.s.status.wpos, speed, Instant::now());
+                jog.go_to(Point {
                     x,
                     y,
-                    speed,
-                    active_speed: speed,
-                    cursor: self.s.status.wpos,
-                    step,
-                    target: Point {
-                        x: self.s.status.wpos.x + x * step,
-                        y: self.s.status.wpos.y + y * step,
-                        z: self.s.status.wpos.z,
-                    },
-                    origin: self.s.status.wpos,
-                    heartbeat: Instant::now(),
-                    extended: Instant::now(),
-                    sent: false,
-                    sent_at: None,
-                    released: false,
+                    z: self.s.status.wpos.z,
                 });
-                if cancelled {
+                self.jog = Some(jog);
+                if was_sent {
                     self.begin_jog_restart()?;
                 }
                 self.preview_dirty = true;
             }
+            #[cfg(test)]
             Action::FinishJog => {
-                // A normal release completes the selected increment, including a
-                // short tap. Focus loss, Stop and heartbeat expiry cancel instead.
-                if let Some(jog) = &mut self.jog {
-                    // Finish only the increment boundary needed by motion
-                    // already sent, rather than an unsent lookahead target.
-                    let sent_distance = (jog.cursor.x - jog.origin.x) * jog.x
-                        + (jog.cursor.y - jog.origin.y) * jog.y;
-                    let distance = ((sent_distance / jog.step - 1e-9).ceil().max(1.0)) * jog.step;
-                    jog.target = Point {
-                        x: jog.origin.x + jog.x * distance,
-                        y: jog.origin.y + jog.y * distance,
-                        z: jog.origin.z,
-                    };
-                    jog.released = true;
+                if let Some(jog) = &self.jog {
+                    self.jog_input([0, 0], [0, 0], jog.speed, 1.0)?;
                 }
             }
             Action::CancelJog => {
@@ -1643,6 +1627,13 @@ impl Worker {
                     !address.contains(['\n', '\r']) && http.starts_with("http://"),
                     "Use a TCP host:port and an http:// URL"
                 );
+                if self.address != address {
+                    self.trace_restore = self
+                        .trace_recovery
+                        .get(&address)
+                        .map(TraceRestore::interrupted);
+                    self.cancel_trace_on_connect = self.trace_restore.is_some();
+                }
                 self.address = address;
                 self.http = http.trim_end_matches('/').into();
                 self.disconnected("Connection settings changed".into());
@@ -1657,6 +1648,9 @@ impl Worker {
                         self.realtime(b"?")?;
                     }
                     "!" => {
+                        if self.trace.is_some() {
+                            return self.action(Action::CancelTrace);
+                        }
                         if self.s.status.state == "Run" {
                             self.s.job = true;
                         }
@@ -1684,6 +1678,7 @@ impl Worker {
                         self.queue.push_back(QueuedCommand {
                             text: command.into(),
                             manual: true,
+                            trace: false,
                         });
                     }
                 }
@@ -1695,7 +1690,18 @@ impl Worker {
                 );
                 self.change_jog_speed(speed)?;
             }
-            Action::TraceHull { speed } => {
+            Action::TraceSpeed { boosted } => {
+                let target = if boosted { 100 } else { 25 };
+                if let Some(trace) = &self.trace
+                    && trace.override_percent != target
+                {
+                    let sent = self.set_feed_override(target)?;
+                    let trace = self.trace.as_mut().unwrap();
+                    trace.override_percent = target;
+                    trace.override_sent = Some(sent);
+                }
+            }
+            Action::TraceHull { speed, boosted } => {
                 ensure!(
                     self.s.can_jog()
                         && self.s.status.idle()
@@ -1733,6 +1739,15 @@ impl Worker {
                 hull.rotate_left(closest);
                 hull.push(hull[0]);
                 hull.push(Point { z: 0.0, ..start });
+                let saved = SavedTrace {
+                    feed: (self.s.status.feed_override * 100.0).round() as u8,
+                    modal: self.trace_modal_restore(),
+                };
+                ensure!(
+                    self.s.status.override_at.is_some(),
+                    "Wait for a controller override report"
+                );
+                self.trace_recovery.begin(&self.address, saved.clone())?;
                 if program.uploaded != self.s.program.as_ref().unwrap().uploaded {
                     self.need_upload = true;
                     self.failed_transfer = false;
@@ -1745,27 +1760,25 @@ impl Worker {
                 self.s.error = None;
                 self.s
                     .log(format!("Tracing hull at {speed:.0} mm/min with torch off"));
+                self.trace_restore = Some(TraceRestore {
+                    saved,
+                    phase: RestorePhase::Tracing,
+                    outcome: "Hull trace complete; returned to starting position".into(),
+                });
                 self.trace = Some(Trace {
                     points: hull,
                     next: 0,
                     sent: None,
-                    speed,
-                    active_speed: speed,
-                    cursor: Point { z: 0.0, ..start },
-                    buffered: VecDeque::from([TracePoint {
-                        point: Point { z: 0.0, ..start },
-                        target: 0,
-                    }]),
+                    nominal_feed: speed * 4.0,
+                    override_percent: if boosted { 100 } else { 25 },
+                    override_sent: None,
+                    prepared: false,
                 });
             }
             Action::CancelTrace => {
-                self.trace = None;
-                self.s.tracing = false;
-                self.jog_restart = None;
-                self.s.jog_restarting = false;
-                self.queue.retain(|cmd| !cmd.starts_with("$J="));
-                self.realtime(&[protocol::JOG_CANCEL])?;
-                self.s.phase = "Hull trace cancelled".into();
+                if self.trace.is_some() {
+                    self.action(Action::Stop)?;
+                }
             }
         }
         Ok(())
@@ -1825,11 +1838,6 @@ impl Worker {
     fn change_jog_speed(&mut self, speed: f64) -> Result<()> {
         let mut changed = false;
         let mut sent = false;
-        if let Some(trace) = &mut self.trace {
-            changed |= trace.speed != speed;
-            sent |= trace.sent.is_some();
-            trace.speed = speed;
-        }
         if let Some(jog) = &mut self.jog {
             changed |= jog.speed != speed;
             sent |= jog.sent;
@@ -1857,7 +1865,7 @@ impl Worker {
         let Some(restart) = &self.jog_restart else {
             return Ok(());
         };
-        if self.jog.is_none() && self.trace.is_none() {
+        if self.jog.is_none() {
             self.jog_restart = None;
             self.s.jog_restarting = false;
             return Ok(());
@@ -1901,121 +1909,140 @@ impl Worker {
             return Ok(());
         }
         let current = self.s.status.wpos;
-        if let Some(trace) = &mut self.trace {
-            let current = Point { z: 0.0, ..current };
-            trace.buffered_distance(current);
-            trace.next = trace.buffered[0].target;
-            trace.cursor = current;
-            trace.buffered = VecDeque::from([TracePoint {
-                point: current,
-                target: trace.next,
-            }]);
-            trace.sent = None;
-            trace.active_speed = trace.speed;
-        }
         if let Some(jog) = &mut self.jog {
-            if !jog.sent {
-                // A direction change during cancellation starts its new
-                // increment at the stopped position, not a stale report.
-                jog.origin = current;
-                jog.target = Point {
-                    x: current.x + jog.x * jog.step,
-                    y: current.y + jog.y * jog.step,
-                    z: current.z,
-                };
-            }
-            jog.cursor = current;
-            jog.sent = true; // Resume with absolute coordinates at the original increment target.
-            jog.sent_at = None;
-            jog.active_speed = jog.speed;
+            jog.rebase(current, Instant::now());
         }
         self.jog_restart = None;
         self.s.jog_restarting = false;
+        Ok(())
+    }
+    fn jog_input(
+        &mut self,
+        directions: [i8; 2],
+        presses: [i32; 2],
+        speed: f64,
+        step: f64,
+    ) -> Result<()> {
+        ensure!(
+            self.s.can_jog() && !self.s.status.torch && self.stopping.is_none(),
+            "Jogging requires an idle machine and torch off"
+        );
+        ensure!(
+            speed.is_finite()
+                && (1.0..=3000.0).contains(&speed)
+                && step.is_finite()
+                && (0.001..=100.0).contains(&step)
+                && directions.iter().all(|d| (-1..=1).contains(d)),
+            "Invalid jog input"
+        );
+        let now = Instant::now();
+        let jog = self
+            .jog
+            .get_or_insert_with(|| ManualJog::new(self.s.status.wpos, speed, now));
+        jog.observe(self.s.status.wpos, now);
+        let changed = jog.input(directions, presses, step, now);
+        let speed_changed = jog.speed != speed;
+        jog.speed = speed;
+        if changed && !jog.sent {
+            // Nothing has entered the jog queue yet, so apply held-release
+            // cancellation locally. Waiting for a realtime cancel/restart
+            // would leave the original increment ready to start later.
+            jog.rebase(self.s.status.wpos, now);
+            jog.sent = false;
+        }
+        if (changed || speed_changed) && jog.sent && self.jog_restart.is_none() {
+            self.begin_jog_restart()?;
+        }
+        self.preview_dirty = true;
         Ok(())
     }
     fn advance_jog(&mut self) -> Result<()> {
         let Some(jog) = &mut self.jog else {
             return Ok(());
         };
-        if !jog.released && jog.heartbeat.elapsed() > Duration::from_millis(250)
+        if !jog.released() && jog.heartbeat.elapsed() > Duration::from_millis(250)
             || !self.s.can_jog()
             || self.s.status.torch
         {
             self.action(Action::CancelJog)?;
             return Ok(());
         }
-        if self.jog_restart.is_some() || self.pending.is_some() || !self.queue.is_empty() {
-            return Ok(());
-        }
-        let lookahead = self
-            .s
-            .jog_lookahead(
-                Point {
-                    x: jog.x,
-                    y: jog.y,
-                    z: 0.0,
-                },
-                jog.speed,
-                jog.active_speed,
-                self.jog_ack_delay,
-            )
-            .context("Controller acceleration or planner capacity unavailable for jogging")?;
-        if !jog.released
-            && jog.extended.elapsed() >= Duration::from_millis(100)
-            && jog.target.distance(self.s.status.wpos) <= lookahead.refill + 0.001
+        jog.observe(self.s.status.wpos, Instant::now());
+        if self.jog_restart.is_some()
+            || self.pending.is_some()
+            || !self.queue.is_empty()
+            || self.s.status.planner_free.is_some_and(|free| free < 2)
         {
-            let needed = (lookahead.refill + lookahead.segment
-                - jog.target.distance(self.s.status.wpos))
-            .max(lookahead.segment);
-            let distance = (needed / jog.step).ceil().max(1.0) * jog.step;
-            jog.target.x += jog.x * distance;
-            jog.target.y += jog.y * distance;
-            jog.extended = Instant::now();
-        }
-        let remaining = jog.cursor.distance(jog.target);
-        if remaining < 1e-9 {
-            if jog.released
-                && self.s.status.idle()
-                && self.s.status.wpos.distance(jog.target) < 0.01
-                && jog
-                    .sent_at
-                    .is_none_or(|sent| self.s.status.at.is_some_and(|at| at > sent))
-            {
-                self.jog = None;
-            }
             return Ok(());
         }
-        // Keep enough physical distance ahead for braking and communication,
-        // without using up the planner's capacity with packets that are too short.
-        if jog.sent && jog.cursor.distance(self.s.status.wpos) > lookahead.refill + 0.001 {
-            return Ok(());
-        }
-        let point = jog
-            .cursor
-            .lerp(jog.target, (lookahead.segment / remaining).min(1.0));
-        let command = if jog.sent {
-            format!("$J=G21G90X{:.5}Y{:.5}F{:.1}", point.x, point.y, jog.speed)
+        let held = jog.held_direction(Instant::now());
+        let direction = if held.x != 0.0 || held.y != 0.0 {
+            held
         } else {
-            // Relative first segments preserve separate taps received before
-            // position feedback; subsequent segments use absolute targets.
-            format!(
-                "$J=G21G91X{:.5}Y{:.5}F{:.1}",
-                point.x - jog.cursor.x,
-                point.y - jog.cursor.y,
-                jog.speed
-            )
+            Point {
+                x: jog.target.x - jog.cursor.x,
+                y: jog.target.y - jog.cursor.y,
+                z: 0.0,
+            }
         };
-        self.queue.push_back(command.into());
-        jog.cursor = point;
-        jog.sent = true;
-        jog.sent_at = Some(Instant::now());
-        jog.active_speed = jog.speed;
+        if let Some(lookahead) =
+            self.s
+                .jog_lookahead(direction, jog.speed, jog.active_speed, self.jog_ack_delay)
+        {
+            if jog.extended.elapsed() >= Duration::from_millis(100)
+                && jog.target.distance(self.s.status.wpos) <= lookahead.refill + 0.001
+            {
+                jog.extend(
+                    self.s.status.wpos,
+                    lookahead.refill + lookahead.segment,
+                    Instant::now(),
+                );
+            }
+            let remaining = jog.cursor.distance(jog.target);
+            if remaining > 1e-9 {
+                if jog.sent && jog.cursor.distance(self.s.status.wpos) > lookahead.refill + 0.001 {
+                    return Ok(());
+                }
+                let point = jog
+                    .cursor
+                    .lerp(jog.target, (lookahead.segment / remaining).min(1.0));
+                self.queue.push_back(
+                    format!("$J=G21G90X{:.5}Y{:.5}F{:.1}", point.x, point.y, jog.speed).into(),
+                );
+                jog.cursor = point;
+                jog.sent = true;
+                jog.sent_at = Some(Instant::now());
+                jog.active_speed = jog.speed;
+                return Ok(());
+            }
+        }
+        if jog.released()
+            && self.s.status.idle()
+            && (self.s.status.wpos.distance(jog.target) < 0.01
+                || jog
+                    .sent_at
+                    .is_some_and(|sent| sent.elapsed() >= Duration::from_millis(500)))
+            && jog
+                .sent_at
+                .is_none_or(|sent| self.s.status.at.is_some_and(|at| at > sent))
+        {
+            self.jog = None;
+        }
         Ok(())
     }
     fn reset_controller(&mut self) -> Result<()> {
+        if self.trace_restore.is_some()
+            && self.s.status.fresh()
+            && (self.s.status.held() || self.s.status.idle())
+            && self.s.status.position_known
+            && self.s.status.wco_known
+            && let Err(e) = self.coordinates.record(&self.address, self.s.status.wpos)
+        {
+            self.fail(format!("Cannot checkpoint stopped trace position: {e:#}"));
+        }
         self.realtime(&[protocol::RESET])?;
         self.s.job = false;
-        self.s.tracing = false;
+        self.s.tracing = self.trace_restore.is_some();
         self.trace = None;
         self.stopping = None;
         self.pause = PauseState::None;
@@ -2032,6 +2059,9 @@ impl Worker {
         self.got_units = false;
         self.auto_reports = false;
         self.reset_wait = Some(Instant::now());
+        if let Some(restore) = &mut self.trace_restore {
+            restore.phase = RestorePhase::WaitingIdle;
+        }
         self.s.phase = "Stopped".into();
         self.need_verify = self.s.program.is_some();
         self.s.log("Job stopped; controller reset");
@@ -2054,90 +2084,179 @@ impl Worker {
         }
         Ok(())
     }
-    fn advance_trace(&mut self) -> Result<()> {
-        if self.trace.is_none() {
+    fn trace_modal_restore(&self) -> String {
+        let o = self.s.options;
+        format!(
+            "{}{}{}G{}F{:.8}",
+            if o.initial_mm { "G21" } else { "G20" },
+            if o.initial_absolute { "G90" } else { "G91" },
+            if o.initial_feed_per_minute {
+                "G94"
+            } else {
+                "G93"
+            },
+            o.initial_motion,
+            o.initial_feed / if o.initial_mm { 1.0 } else { 25.4 }
+        )
+    }
+    fn set_feed_override(&mut self, target: u8) -> Result<Instant> {
+        ensure!((10..=200).contains(&target), "Invalid feed override");
+        let mut bytes = vec![0x90];
+        let difference = i16::from(target) - 100;
+        let coarse = if difference >= 0 { 0x91 } else { 0x92 };
+        let fine = if difference >= 0 { 0x93 } else { 0x94 };
+        bytes.extend(std::iter::repeat_n(
+            coarse,
+            difference.unsigned_abs() as usize / 10,
+        ));
+        bytes.extend(std::iter::repeat_n(
+            fine,
+            difference.unsigned_abs() as usize % 10,
+        ));
+        bytes.push(b'?');
+        self.realtime(&bytes)?;
+        self.poll = Instant::now();
+        Ok(Instant::now())
+    }
+    fn queue_trace(&mut self, text: String) {
+        self.queue.push_back(QueuedCommand {
+            text,
+            manual: false,
+            trace: true,
+        });
+    }
+    fn advance_trace_restore(&mut self) -> Result<()> {
+        let Some(restore) = &self.trace_restore else {
             return Ok(());
-        }
-        if self.s.status.torch {
-            self.reset_controller()?;
-            anyhow::bail!("Hull trace stopped because the torch was reported on");
-        }
-        if self.s.status.state.contains("Alarm") {
-            self.trace = None;
-            self.s.tracing = false;
-            self.jog_restart = None;
-            self.s.jog_restarting = false;
-            self.s.phase = "Hull trace stopped by alarm".into();
-            return Ok(());
-        }
-        if !self.s.connected
+        };
+        if matches!(
+            restore.phase,
+            RestorePhase::Tracing | RestorePhase::WaitingReset
+        ) || !self.s.connected
             || !self.s.status.fresh()
-            || self.jog_restart.is_some()
+            || self.stopping.is_some()
             || self.pending.is_some()
             || !self.queue.is_empty()
         {
             return Ok(());
         }
-        let trace = self.trace.as_mut().unwrap();
-        let current = Point {
-            z: 0.0,
-            ..self.s.status.wpos
-        };
-        // Queue across vertices so the controller can blend short curve edges
-        // instead of decelerating to Idle at every sampled point.
-        while trace.next < trace.points.len()
-            && trace.cursor.distance(trace.points[trace.next]) < 1e-9
-        {
-            trace.next += 1;
+        let alarm = self.s.status.state == "Alarm";
+        if !alarm && (!self.s.initialized || !self.s.status.idle()) {
+            return Ok(());
         }
-        if trace.next == trace.points.len() {
-            if !self.s.status.idle()
-                || trace
-                    .sent
-                    .is_some_and(|sent| self.s.status.at.is_none_or(|at| at <= sent))
-                || current.distance(trace.cursor) > 0.01
-            {
+        match restore.phase {
+            RestorePhase::WaitingIdle if !alarm => {
+                let modal = restore.saved.modal.clone();
+                self.queue_trace(modal);
+                self.queue_trace("$G".into());
+                self.trace_restore.as_mut().unwrap().phase = RestorePhase::ModalQueued;
+            }
+            RestorePhase::WaitingIdle | RestorePhase::ModalQueued => {
+                let target = restore.saved.feed;
+                let sent = self.set_feed_override(target)?;
+                self.trace_restore.as_mut().unwrap().phase = RestorePhase::Override { sent };
+            }
+            RestorePhase::Override { sent } => {
+                if self.s.status.override_at.is_some_and(|at| at > sent)
+                    && (self.s.status.feed_override * 100.0 - f64::from(restore.saved.feed)).abs()
+                        < 0.5
+                {
+                    self.trace_recovery.finish(&self.address)?;
+                    let restore = self.trace_restore.take().unwrap();
+                    self.s.tracing = false;
+                    self.s.phase = restore.outcome.clone();
+                    self.s.log(restore.outcome);
+                } else if sent.elapsed() > Duration::from_secs(3) {
+                    anyhow::bail!(
+                        "Feed override restoration not confirmed; motion remains blocked"
+                    );
+                } else if self.poll.elapsed() > Duration::from_millis(50) {
+                    self.realtime(b"?")?;
+                    self.poll = Instant::now();
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn advance_trace(&mut self) -> Result<()> {
+        let Some(trace) = &self.trace else {
+            return Ok(());
+        };
+        if self.s.status.torch {
+            self.action(Action::Stop)?;
+            anyhow::bail!("Hull trace stopped because the torch was reported on");
+        }
+        if self.s.status.state == "Alarm" {
+            self.trace = None;
+            if let Some(restore) = &mut self.trace_restore {
+                restore.phase = RestorePhase::WaitingIdle;
+                restore.outcome = "Hull trace stopped by alarm".into();
+            }
+            self.queue.retain(|cmd| !cmd.trace);
+            return Ok(());
+        }
+        if !self.s.connected
+            || !self.s.status.fresh()
+            || self.stopping.is_some()
+            || self.pending.is_some()
+            || !self.queue.is_empty()
+        {
+            return Ok(());
+        }
+        if !trace.prepared {
+            if trace.override_sent.is_none() {
+                let sent = self.set_feed_override(trace.override_percent)?;
+                self.trace.as_mut().unwrap().override_sent = Some(sent);
                 return Ok(());
             }
-            self.trace = None;
-            self.s.tracing = false;
-            self.s.phase = "Hull trace complete".into();
-            self.s
-                .log("Hull trace complete; returned to starting position");
+            if trace
+                .override_sent
+                .is_some_and(|at| at.elapsed() > Duration::from_secs(3))
+            {
+                self.action(Action::Stop)?;
+                anyhow::bail!("Trace feed override was not confirmed; trace cancelled");
+            }
+            if self.s.status.override_at <= trace.override_sent
+                || (self.s.status.feed_override * 100.0 - f64::from(trace.override_percent)).abs()
+                    > 0.5
+            {
+                if self.poll.elapsed() > Duration::from_millis(50) {
+                    self.realtime(b"?")?;
+                    self.poll = Instant::now();
+                }
+                return Ok(());
+            }
+            self.queue_trace("G21G90G94M5".into());
+            self.trace.as_mut().unwrap().prepared = true;
+            return Ok(());
+        }
+        if trace.next == trace.points.len() {
+            if self.s.status.idle()
+                && self.s.status.at > trace.sent
+                && self.s.status.wpos.distance(Point {
+                    z: self.s.status.wpos.z,
+                    ..*trace.points.last().unwrap()
+                }) < 0.01
+            {
+                self.trace = None;
+                self.trace_restore.as_mut().unwrap().phase = RestorePhase::WaitingIdle;
+                self.s.phase = "Restoring feed override…".into();
+            }
+            return Ok(());
+        }
+        if self.s.status.planner_free.is_some_and(|free| free < 2) {
             return Ok(());
         }
         let target = trace.points[trace.next];
-        let remaining = trace.cursor.distance(target);
-        let lookahead = self
-            .s
-            .jog_lookahead(
-                Point {
-                    x: target.x - trace.cursor.x,
-                    y: target.y - trace.cursor.y,
-                    z: 0.0,
-                },
-                trace.speed,
-                trace.active_speed,
-                self.jog_ack_delay,
-            )
-            .context("Controller acceleration or planner capacity unavailable for hull tracing")?;
-        if trace.buffered_distance(current) > lookahead.refill + 0.001 {
-            return Ok(());
-        }
-        let point = trace
-            .cursor
-            .lerp(target, (lookahead.segment / remaining).min(1.0));
-        self.queue.push_back(
-            format!("$J=G21G90X{:.5}Y{:.5}F{:.1}", point.x, point.y, trace.speed).into(),
+        let command = format!(
+            "G21G90G94G1X{:.5}Y{:.5}F{:.1}",
+            target.x, target.y, trace.nominal_feed
         );
-        trace.cursor = point;
-        trace.buffered.push_back(TracePoint {
-            point,
-            target: trace.next,
-        });
-        trace.sent = Some(Instant::now());
-        trace.active_speed = trace.speed;
-        self.s.phase = format!("Tracing hull · {}/{}", trace.next + 1, trace.points.len());
+        self.queue_trace(command);
+        let trace = self.trace.as_mut().unwrap();
+        trace.next += 1;
+        self.s.phase = format!("Tracing hull · {}/{}", trace.next, trace.points.len());
         Ok(())
     }
     fn advance_transfer(&mut self) {
@@ -2344,7 +2463,7 @@ mod tests {
     // rate, assumes a stop at the last received endpoint, has finite planner slots,
     // and delays both command acknowledgements and position reports. Unlike the
     // loopback simulator, it does not teleport to commanded targets.
-    fn check_sustained_speed(trace: bool, acceleration: f64, blocks: usize, one_way: f64) {
+    fn check_sustained_speed(acceleration: f64, blocks: usize, one_way: f64) {
         let (_sim, mut worker) = connected_worker();
         worker
             .s
@@ -2352,21 +2471,14 @@ mod tests {
             .update("<Idle|MPos:0,0,0|WCO:0,0,0|Ov:100,100,100>", false);
         worker.s.acceleration = [Some(acceleration); 2];
         worker.s.planner_blocks = Some(blocks);
-        if trace {
-            worker.s.program = Some(Arc::new(
-                gcode::parse("G21G90\nG0X10000Y0\nG1Y100F3000\nX0\nY0", worker.s.options).unwrap(),
-            ));
-            worker.action(Action::TraceHull { speed: 3000.0 }).unwrap();
-        } else {
-            worker
-                .action(Action::Jog {
-                    x: 1.0,
-                    y: 0.0,
-                    speed: 3000.0,
-                    step: 0.1,
-                })
-                .unwrap();
-        }
+        worker
+            .action(Action::Jog {
+                x: 1.0,
+                y: 0.0,
+                speed: 3000.0,
+                step: 0.1,
+            })
+            .unwrap();
         struct InFlight {
             command: QueuedCommand,
             endpoint: f64,
@@ -2445,22 +2557,16 @@ mod tests {
                 jog.heartbeat = Instant::now();
                 jog.extended = Instant::now() - Duration::from_secs_f64(now - extension_at);
             }
-            if trace {
-                worker.advance_trace().unwrap();
-            } else {
-                worker.advance_jog().unwrap();
-            }
+            worker.jog.as_mut().unwrap().axes[0].pressed =
+                Some(Instant::now() - Duration::from_secs(1));
+            worker.advance_jog().unwrap();
             if before != worker.jog.as_ref().map(|jog| jog.target) {
                 extension_at = now;
             }
             if in_flight.is_none()
                 && let Some(command) = worker.queue.pop_front()
             {
-                let endpoint = if trace {
-                    worker.trace.as_ref().unwrap().cursor.x
-                } else {
-                    worker.jog.as_ref().unwrap().cursor.x
-                };
+                let endpoint = worker.jog.as_ref().unwrap().cursor.x;
                 worker.pending = Some((command.clone(), Instant::now()));
                 in_flight = Some(InFlight {
                     command,
@@ -2476,23 +2582,21 @@ mod tests {
         }
         assert!(
             sustained >= 49.5,
-            "trace={trace}, a={acceleration}, slots={blocks}, RTT={}: sustained {sustained} mm/s",
+            "a={acceleration}, slots={blocks}, RTT={}: sustained {sustained} mm/s",
             one_way * 2.0
         );
         assert!(
             max_blocks < blocks - 1,
-            "trace={trace}, a={acceleration}, slots={blocks}, one-way={one_way}: {max_blocks} planner blocks used, sustained {sustained}"
+            "a={acceleration}, slots={blocks}, one-way={one_way}: {max_blocks} planner blocks used, sustained {sustained}"
         );
     }
 
     #[test]
-    fn jog_and_trace_reach_full_speed_with_acceleration_and_delayed_feedback() {
-        for trace in [false, true] {
-            for (acceleration, slots, one_way) in
-                [(100.0, 16, 0.03), (100.0, 10, 0.07), (5.0, 10, 0.07)]
-            {
-                check_sustained_speed(trace, acceleration, slots, one_way);
-            }
+    fn jog_reaches_full_speed_with_acceleration_and_delayed_feedback() {
+        for (acceleration, slots, one_way) in
+            [(100.0, 16, 0.03), (100.0, 10, 0.07), (5.0, 10, 0.07)]
+        {
+            check_sustained_speed(acceleration, slots, one_way);
         }
     }
 
@@ -2556,69 +2660,203 @@ mod tests {
     }
 
     #[test]
-    fn quick_jog_tap_completes_exactly_one_increment() {
+    fn quick_taps_accumulate_and_use_explicit_absolute_mm_commands() {
         let (_sim, mut worker) = connected_worker();
         worker
-            .action(Action::Jog {
-                x: 1.0,
-                y: 0.0,
+            .action(Action::JogInput {
+                directions: [0, 0],
+                presses: [2, 1],
                 speed: 600.0,
                 step: 0.25,
             })
             .unwrap();
-        // Both input messages may arrive before the worker's next motion tick.
-        worker.action(Action::FinishJog).unwrap();
+        assert_eq!(
+            worker.jog.as_ref().unwrap().target,
+            Point {
+                x: 10.5,
+                y: 20.25,
+                z: 0.0
+            }
+        );
         worker.advance_jog().unwrap();
-        assert_eq!(worker.queue.len(), 1);
-        assert_eq!(worker.queue[0], "$J=G21G91X0.25000Y0.00000F600.0");
-        assert!(worker.jog.as_ref().unwrap().released);
+        assert_eq!(worker.queue[0], "$J=G21G90X10.50000Y20.25000F600.0");
+        assert!(worker.jog.as_ref().unwrap().released());
         worker.advance_jog().unwrap();
         assert_eq!(worker.queue.len(), 1);
         let command = worker.queue.pop_front().unwrap();
         worker.pending = Some((command, Instant::now()));
         worker.line("ok").unwrap();
-        worker.line("<Idle|MPos:10.25,20,0>").unwrap();
+        worker.line("<Idle|MPos:10.5,20.25,0>").unwrap();
         worker.advance_jog().unwrap();
         assert!(worker.jog.is_none());
+    }
+    #[test]
+    fn unsent_held_release_never_starts_after_a_pending_command_finishes() {
+        let (_sim, mut worker) = connected_worker();
+        worker.pending = Some(("$G".into(), Instant::now()));
+        worker
+            .action(Action::JogInput {
+                directions: [1, 0],
+                presses: [1, 0],
+                speed: 600.0,
+                step: 100.0,
+            })
+            .unwrap();
+        worker.jog.as_mut().unwrap().axes[0].pressed =
+            Some(Instant::now() - Duration::from_millis(200));
+        worker.advance_jog().unwrap();
         assert!(worker.queue.is_empty());
+        worker
+            .action(Action::JogInput {
+                directions: [0, 0],
+                presses: [0, 0],
+                speed: 600.0,
+                step: 100.0,
+            })
+            .unwrap();
+        assert!(!worker.jog.as_ref().unwrap().sent);
+        assert!(!worker.s.jog_restarting);
+        worker.line("ok").unwrap();
+        for _ in 0..3 {
+            worker.advance_jog().unwrap();
+        }
+        assert!(
+            worker.queue.is_empty(),
+            "A released hold must not launch delayed motion"
+        );
+        assert!(worker.jog.is_none());
     }
 
     #[test]
-    fn held_jog_extends_in_increments_without_building_a_backlog() {
+    fn unsent_simple_tap_still_finishes_after_a_pending_command() {
+        let (_sim, mut worker) = connected_worker();
+        worker.pending = Some(("$G".into(), Instant::now()));
+        worker
+            .action(Action::JogInput {
+                directions: [1, 0],
+                presses: [1, 0],
+                speed: 600.0,
+                step: 1.0,
+            })
+            .unwrap();
+        worker
+            .action(Action::JogInput {
+                directions: [0, 0],
+                presses: [0, 0],
+                speed: 600.0,
+                step: 1.0,
+            })
+            .unwrap();
+        worker.line("ok").unwrap();
+        worker.advance_jog().unwrap();
+        assert_eq!(worker.queue.len(), 1);
+        assert_eq!(worker.queue[0], "$J=G21G90X11.00000Y20.00000F600.0");
+    }
+
+    #[test]
+    fn unsent_held_release_preserves_the_other_axis_still_held() {
+        let (_sim, mut worker) = connected_worker();
+        worker.pending = Some(("$G".into(), Instant::now()));
+        worker
+            .action(Action::JogInput {
+                directions: [1, 1],
+                presses: [1, 1],
+                speed: 600.0,
+                step: 100.0,
+            })
+            .unwrap();
+        for axis in &mut worker.jog.as_mut().unwrap().axes {
+            axis.pressed = Some(Instant::now() - Duration::from_millis(200));
+        }
+        worker
+            .action(Action::JogInput {
+                directions: [0, 1],
+                presses: [0, 0],
+                speed: 600.0,
+                step: 100.0,
+            })
+            .unwrap();
+        worker.line("ok").unwrap();
+        worker.advance_jog().unwrap();
+        assert_eq!(worker.queue.len(), 1);
+        assert_eq!(worker.queue[0], "$J=G21G90X10.00000Y21.00000F600.0");
+    }
+
+    #[test]
+    fn held_release_cancels_and_resumes_only_the_still_held_axis() {
         let (_sim, mut worker) = connected_worker();
         worker
-            .action(Action::Jog {
-                x: 0.0,
-                y: -1.0,
+            .action(Action::JogInput {
+                directions: [1, 1],
+                presses: [1, 1],
                 speed: 600.0,
-                step: 0.3,
+                step: 1.0,
+            })
+            .unwrap();
+        let ago = Instant::now() - Duration::from_secs(1);
+        for axis in &mut worker.jog.as_mut().unwrap().axes {
+            axis.pressed = Some(ago);
+        }
+        worker.jog.as_mut().unwrap().extended = ago;
+        worker.advance_jog().unwrap();
+        worker.queue.clear();
+        worker.line("<Jog|MPos:11.5,21.5,0>").unwrap();
+        worker
+            .action(Action::JogInput {
+                directions: [0, 1],
+                presses: [0, 0],
+                speed: 600.0,
+                step: 1.0,
+            })
+            .unwrap();
+        assert!(worker.s.jog_restarting);
+        worker.advance_jog_restart().unwrap();
+        worker.line("<Idle|MPos:11.8,21.8,0>").unwrap();
+        worker.advance_jog_restart().unwrap();
+        worker.advance_jog().unwrap();
+        let cmd = worker.queue.pop_front().unwrap();
+        assert!(cmd.starts_with("$J=G21G90X11.80000Y"), "{cmd}");
+        assert!(worker.jog.as_ref().unwrap().target.y > 21.8);
+        worker.action(Action::CancelJog).unwrap();
+        assert!(worker.jog.is_none() && worker.queue.is_empty());
+    }
+    #[test]
+    fn a_controller_clamped_jog_resets_to_actual_position_after_idle_grace() {
+        let (_sim, mut worker) = connected_worker();
+        worker
+            .action(Action::JogInput {
+                directions: [0, 0],
+                presses: [1, 0],
+                speed: 600.0,
+                step: 1.0,
             })
             .unwrap();
         worker.advance_jog().unwrap();
-        worker.queue.clear(); // First command acknowledged.
-        worker.s.status.wpos.y = 19.7;
-        worker.jog.as_mut().unwrap().extended = Instant::now() - Duration::from_millis(101);
-        worker.advance_jog().unwrap();
-        assert_eq!(worker.queue[0], "$J=G21G90X10.00000Y18.70000F600.0");
         worker.queue.clear();
-        // Without position progress, repeated heartbeats must not run farther ahead.
-        for _ in 0..5 {
-            worker.jog.as_mut().unwrap().extended = Instant::now() - Duration::from_millis(101);
-            worker.advance_jog().unwrap();
-            let jog = worker.jog.as_ref().unwrap();
-            let increments = (20.0 - jog.target.y) / 0.3;
-            assert!((increments - increments.round()).abs() < 1e-8);
-            assert!(jog.cursor.distance(worker.s.status.wpos) < 3.5);
-            worker.queue.clear();
-        }
-        worker.jog.as_mut().unwrap().heartbeat = Instant::now() - Duration::from_millis(251);
+        worker.jog.as_mut().unwrap().sent_at = Some(Instant::now() - Duration::from_millis(600));
+        report_stopped(
+            &mut worker,
+            Point {
+                x: 10.5,
+                y: 20.0,
+                z: 0.0,
+            },
+        );
         worker.advance_jog().unwrap();
-        assert!(worker.jog.is_none() && worker.queue.is_empty());
-        assert!(worker.s.console.back().unwrap().contains("cancel jog"));
+        assert!(worker.jog.is_none());
+        worker
+            .action(Action::JogInput {
+                directions: [0, 0],
+                presses: [-1, 0],
+                speed: 600.0,
+                step: 1.0,
+            })
+            .unwrap();
+        assert_eq!(worker.jog.as_ref().unwrap().target.x, 9.5);
     }
 
     #[test]
-    fn cancel_after_releasing_a_tap_removes_unsent_motion() {
+    fn planner_slots_and_input_heartbeat_gate_jog_commands() {
         let (_sim, mut worker) = connected_worker();
         worker
             .action(Action::Jog {
@@ -2628,16 +2866,16 @@ mod tests {
                 step: 1.0,
             })
             .unwrap();
+        worker.s.status.planner_free = Some(1);
         worker.advance_jog().unwrap();
-        worker.action(Action::FinishJog).unwrap();
-        worker.action(Action::CancelJog).unwrap();
+        assert!(worker.queue.is_empty());
+        worker.s.status.planner_free = Some(2);
+        worker.advance_jog().unwrap();
+        assert_eq!(worker.queue.len(), 1);
+        worker.jog.as_mut().unwrap().heartbeat = Instant::now() - Duration::from_millis(251);
+        worker.advance_jog().unwrap();
         assert!(worker.jog.is_none() && worker.queue.is_empty());
-        // Cancellation must also work after transmission, before either the ack
-        // or the first Jog status report has arrived.
-        let cancelled = worker.s.console.len();
-        worker.pending = Some(("$J=G21G91X1F600".into(), Instant::now()));
-        worker.action(Action::CancelJog).unwrap();
-        assert_eq!(worker.s.console.len(), cancelled + 1);
+        assert!(worker.s.console.back().unwrap().contains("cancel jog"));
     }
 
     #[test]
@@ -2703,9 +2941,8 @@ mod tests {
             ))
             .unwrap();
     }
-
     #[test]
-    fn jog_speed_changes_interrupt_pending_motion_and_preserve_increment_target() {
+    fn shift_cancels_pending_jog_and_preserves_unfinished_increment() {
         let (_sim, mut worker) = connected_worker();
         worker
             .action(Action::Jog {
@@ -2716,109 +2953,16 @@ mod tests {
             })
             .unwrap();
         worker.advance_jog().unwrap();
-        let command = worker.queue.pop_front().unwrap();
-        worker.pending = Some((command, Instant::now()));
-        let target = worker.jog.as_ref().unwrap().target;
-        // A newer status still says Idle, but the first packet has no ack yet.
-        worker
-            .action(Action::Jog {
-                x: 1.0,
-                y: 0.0,
-                speed: 2400.0,
-                step: 100.0,
-            })
-            .unwrap();
+        let cmd = worker.queue.pop_front().unwrap();
+        worker.pending = Some((cmd, Instant::now()));
+        worker.action(Action::JogSpeed { speed: 2400.0 }).unwrap();
         assert!(worker.s.console.back().unwrap().contains("cancel jog"));
-        assert!(worker.s.jog_restarting);
-        assert!(!worker.s.can_run() && !worker.s.can_manage_files());
         worker.advance_jog_restart().unwrap();
-        worker.advance_jog().unwrap();
-        assert!(worker.pending.is_some() && worker.queue.is_empty());
         assert!(worker.jog_restart.as_ref().unwrap().fence.is_none());
         worker.line("ok").unwrap();
         worker.advance_jog_restart().unwrap();
-        // The pre-cancel Idle sample cannot authorize replacement motion.
-        worker.advance_jog_restart().unwrap();
-        worker.advance_jog().unwrap();
-        assert!(worker.queue.is_empty());
-        // Continued deceleration also cannot authorize replacement motion.
-        worker.line("<Jog|MPos:10.3,20,0|FS:300,0>").unwrap();
         worker.advance_jog_restart().unwrap();
         assert!(worker.s.jog_restarting);
-        let stopped = Point {
-            x: 10.4,
-            y: 20.0,
-            z: 0.0,
-        };
-        report_stopped(&mut worker, stopped);
-        worker.advance_jog_restart().unwrap();
-        assert!(!worker.s.jog_restarting);
-        assert_eq!(worker.jog.as_ref().unwrap().cursor, stopped);
-        assert_eq!(worker.jog.as_ref().unwrap().target, target);
-        // The fresh Idle report belongs to the restart. It cannot authorize
-        // unrelated motion or offset changes while the jog is about to resume.
-        worker.s.ready = true;
-        assert!(worker.action(Action::Run).is_err());
-        assert!(
-            worker
-                .action(Action::SetCoordinate {
-                    axis: 'X',
-                    value: 0.0
-                })
-                .is_err()
-        );
-        assert!(worker.action(Action::Console("G0X0".into())).is_err());
-        worker.s.ready = false;
-        worker.advance_jog().unwrap();
-        assert_eq!(
-            worker.queue.pop_front().unwrap(),
-            "$J=G21G90X14.40000Y20.00000F2400.0"
-        );
-        // Releasing Shift discards the fast buffer too; rapid toggles during
-        // deceleration coalesce to the most recently requested speed.
-        worker.action(Action::JogSpeed { speed: 600.0 }).unwrap();
-        let cancellations = worker
-            .s
-            .console
-            .iter()
-            .filter(|s| s.contains("cancel jog"))
-            .count();
-        worker.action(Action::JogSpeed { speed: 2400.0 }).unwrap();
-        worker.action(Action::JogSpeed { speed: 600.0 }).unwrap();
-        assert_eq!(
-            worker
-                .s
-                .console
-                .iter()
-                .filter(|s| s.contains("cancel jog"))
-                .count(),
-            cancellations
-        );
-        worker.advance_jog_restart().unwrap();
-        report_stopped(&mut worker, stopped);
-        worker.advance_jog_restart().unwrap();
-        worker.advance_jog().unwrap();
-        assert!(worker.queue.pop_front().unwrap().ends_with("F600.0"));
-        assert_eq!(worker.jog.as_ref().unwrap().target, target);
-    }
-
-    #[test]
-    fn released_increment_can_change_speed_after_its_last_packet_was_sent() {
-        let (_sim, mut worker) = connected_worker();
-        worker
-            .action(Action::Jog {
-                x: 1.0,
-                y: 0.0,
-                speed: 600.0,
-                step: 1.0,
-            })
-            .unwrap();
-        worker.action(Action::FinishJog).unwrap();
-        worker.advance_jog().unwrap();
-        worker.queue.clear();
-        worker.action(Action::JogSpeed { speed: 2400.0 }).unwrap();
-        assert!(worker.s.jog_restarting);
-        worker.advance_jog_restart().unwrap();
         report_stopped(
             &mut worker,
             Point {
@@ -2831,301 +2975,114 @@ mod tests {
         worker.advance_jog().unwrap();
         assert_eq!(
             worker.queue.pop_front().unwrap(),
-            "$J=G21G90X11.00000Y20.00000F2400.0"
+            "$J=G21G90X14.40000Y20.00000F2400.0"
         );
-        assert!(worker.jog.as_ref().unwrap().released);
-    }
-
-    #[test]
-    fn new_direction_during_a_speed_change_starts_at_the_stopped_position() {
-        let (_sim, mut worker) = connected_worker();
-        worker
-            .action(Action::Jog {
-                x: 1.0,
-                y: 0.0,
-                speed: 600.0,
-                step: 1.0,
-            })
-            .unwrap();
-        worker.advance_jog().unwrap();
-        worker.queue.clear();
-        worker.action(Action::JogSpeed { speed: 2400.0 }).unwrap();
-        worker
-            .action(Action::Jog {
-                x: 0.0,
-                y: 1.0,
-                speed: 2400.0,
-                step: 1.0,
-            })
-            .unwrap();
-        worker.action(Action::FinishJog).unwrap();
-        worker.advance_jog().unwrap();
-        assert!(worker.queue.is_empty());
-        worker.advance_jog_restart().unwrap();
-        let stopped = Point {
-            x: 10.4,
-            y: 20.0,
-            z: 0.0,
-        };
-        report_stopped(&mut worker, stopped);
-        worker.advance_jog_restart().unwrap();
-        assert_eq!(worker.jog.as_ref().unwrap().origin, stopped);
-        worker.advance_jog().unwrap();
-        assert_eq!(
-            worker.queue.pop_front().unwrap(),
-            "$J=G21G90X10.40000Y21.00000F2400.0"
-        );
-    }
-
-    #[test]
-    fn interrupted_speed_changes_never_restart_after_cancel_disconnect_alarm_or_timeout() {
-        for interrupt in [
-            "cancel",
-            "disconnect",
-            "alarm",
-            "timeout",
-            "heartbeat",
-            "stop",
-            "reboot",
-        ] {
-            let (_sim, mut worker) = connected_worker();
-            worker
-                .action(Action::Jog {
-                    x: 1.0,
-                    y: 0.0,
-                    speed: 600.0,
-                    step: 100.0,
-                })
-                .unwrap();
-            worker.advance_jog().unwrap();
-            worker.queue.clear();
-            worker.action(Action::JogSpeed { speed: 2400.0 }).unwrap();
-            worker.advance_jog_restart().unwrap();
-            match interrupt {
-                "cancel" => worker.action(Action::CancelJog).unwrap(),
-                "disconnect" => worker.disconnected("test disconnection".into()),
-                "alarm" => worker.line("ALARM:1").unwrap(),
-                "reboot" => worker.line("Grbl 4.1 [FluidNC reboot]").unwrap(),
-                "stop" => worker.action(Action::Stop).unwrap(),
-                "heartbeat" => {
-                    worker.jog.as_mut().unwrap().heartbeat =
-                        Instant::now() - Duration::from_millis(251);
-                    worker.advance_jog().unwrap();
-                }
-                "timeout" => {
-                    worker.jog_restart.as_mut().unwrap().started =
-                        Instant::now() - Duration::from_secs(6);
-                    assert!(worker.advance_jog_restart().is_err());
-                }
-                _ => unreachable!(),
-            }
-            assert!(worker.jog.is_none(), "{interrupt}");
-            assert!(
-                worker.jog_restart.is_none() && !worker.s.jog_restarting,
-                "{interrupt}"
-            );
-            report_stopped(
-                &mut worker,
-                Point {
-                    x: 10.4,
-                    y: 20.0,
-                    z: 0.0,
-                },
-            );
-            worker.advance_jog_restart().unwrap();
-            worker.advance_jog().unwrap();
-            assert!(
-                !worker.queue.iter().any(|cmd| cmd.starts_with("$J=")),
-                "{interrupt}"
-            );
-        }
-    }
-
-    #[test]
-    fn trace_speed_change_resumes_at_the_physical_edge_without_skipping_queued_vertices() {
-        let (_sim, mut worker) = connected_worker();
-        let point = |x, y| Point { x, y, z: 0.0 };
-        let points = vec![
-            point(2.0, 0.0),
-            point(2.0, 2.0),
-            point(0.0, 2.0),
-            point(0.0, 0.0),
-        ];
-        worker.trace = Some(Trace {
-            points: points.clone(),
-            next: points.len(),
-            cursor: points[3],
-            speed: 2400.0,
-            active_speed: 2400.0,
-            sent: Some(Instant::now()),
-            buffered: std::iter::once(TracePoint {
-                point: point(0.0, 0.0),
-                target: 0,
-            })
-            .chain(
-                points
-                    .iter()
-                    .enumerate()
-                    .map(|(target, &point)| TracePoint { point, target }),
-            )
-            .collect(),
-        });
-        worker.s.tracing = true;
-        worker.s.status.state = "Jog".into();
+        assert_eq!(worker.jog.as_ref().unwrap().target.x, 110.0);
         worker.action(Action::JogSpeed { speed: 600.0 }).unwrap();
-        assert!(worker.s.console.back().unwrap().contains("cancel jog"));
-        worker.advance_jog_restart().unwrap();
-        worker.advance_trace().unwrap();
-        assert!(worker.queue.is_empty());
-        // Stopping has crossed the first vertex, but the remaining two queued
-        // corners have not been reached. Resume up this edge, never diagonally
-        // to the last endpoint of the old planner buffer.
-        report_stopped(&mut worker, point(2.0, 0.8));
-        worker.advance_jog_restart().unwrap();
-        let trace = worker.trace.as_ref().unwrap();
-        assert_eq!(trace.next, 1);
-        assert_eq!(trace.cursor, point(2.0, 0.8));
-        assert_eq!(trace.points, points);
-        worker.advance_trace().unwrap();
-        assert_eq!(
-            worker.queue.pop_front().unwrap(),
-            "$J=G21G90X2.00000Y1.80000F600.0"
+        worker.action(Action::CancelJog).unwrap();
+        report_stopped(
+            &mut worker,
+            Point {
+                x: 11.0,
+                y: 20.0,
+                z: 0.0,
+            },
         );
-        let trace = worker.trace.as_ref().unwrap();
-        assert_eq!(trace.points[trace.next], point(2.0, 2.0));
-        assert_eq!(trace.buffered[0].point, point(2.0, 0.8));
-        // Releasing the trace's cancel control while changing speed cannot
-        // leave a deferred restart waiting to replay motion.
-        worker.action(Action::JogSpeed { speed: 2400.0 }).unwrap();
-        worker.action(Action::CancelTrace).unwrap();
-        report_stopped(&mut worker, point(2.0, 1.0));
         worker.advance_jog_restart().unwrap();
-        worker.advance_trace().unwrap();
-        assert!(worker.trace.is_none() && worker.queue.is_empty() && !worker.s.tracing);
+        worker.advance_jog().unwrap();
+        assert!(worker.jog.is_none() && worker.queue.is_empty());
     }
-
-    #[test]
-    fn curved_trace_queues_across_vertices_with_bounded_path_lookahead() {
-        let (_sim, mut worker) = connected_worker();
-        let start = Point {
-            x: 2.0,
-            y: 0.0,
-            z: 0.0,
-        };
-        worker.s.status.wpos = start;
-        worker.s.options.start = start;
+    fn start_trace(worker: &mut Worker) {
         worker.s.program = Some(Arc::new(
-            gcode::parse("G21G90\nG3X2Y0I-2J0F600", worker.s.options).unwrap(),
+            gcode::parse("G21G90\nG0X0Y0\nG1X10F600\nY10\nX0\nY0", worker.s.options).unwrap(),
         ));
-        worker.action(Action::TraceHull { speed: 600.0 }).unwrap();
-        let vertices = worker.trace.as_ref().unwrap().points.clone();
-        let mut queued = VecDeque::new();
-        let mut distance = 0.0;
-        let mut previous = start;
-        // Leave feedback unchanged while acknowledgements arrive. There must
-        // be several curved edges in the planner, but not a whole revolution.
-        for _ in 0..500 {
-            worker.s.status.at = Some(Instant::now());
-            worker.advance_trace().unwrap();
-            if let Some(cmd) = worker.queue.pop_front() {
-                let point = worker.trace.as_ref().unwrap().cursor;
-                distance += previous.distance(point);
-                previous = point;
-                queued.push_back(point);
-                worker.pending = Some((cmd, Instant::now()));
-                worker.line("ok").unwrap();
-                worker.s.status.state = "Jog".into();
-            }
-        }
-        assert!(worker.trace.as_ref().unwrap().next > 10);
-        assert!((2.0..3.5).contains(&distance), "Buffered {distance} mm");
-        let before = queued.len();
+        worker
+            .action(Action::TraceHull {
+                speed: 600.0,
+                boosted: false,
+            })
+            .unwrap();
         worker.advance_trace().unwrap();
-        assert!(worker.queue.is_empty());
-        assert_eq!(queued.len(), before);
-
-        let mut visited = Vec::new();
-        for _ in 0..1000 {
-            if let Some(point) = queued.pop_front() {
-                worker.s.status.wpos = point;
-                visited.push(point);
-            }
-            worker.s.status.at = Some(Instant::now());
-            worker.advance_trace().unwrap();
-            if let Some(cmd) = worker.queue.pop_front() {
-                queued.push_back(worker.trace.as_ref().unwrap().cursor);
-                worker.pending = Some((cmd, Instant::now()));
-                worker.line("ok").unwrap();
-            }
-            if queued.is_empty() && worker.trace.as_ref().unwrap().next == vertices.len() {
-                break;
-            }
-        }
-        for vertex in vertices {
-            assert!(
-                visited.iter().any(|p| p.distance(vertex) < 1e-9),
-                "Missed {vertex:?}"
-            );
-        }
-        assert!(worker.s.tracing, "Jog feedback cannot finish the trace");
-        worker.s.status.state = "Idle".into();
+        worker
+            .line("<Idle|MPos:10,20,0|WCO:0,0,0|Ov:25,100,100>")
+            .unwrap();
         worker.advance_trace().unwrap();
-        assert!(!worker.s.tracing);
-        assert!(worker.s.status.wpos.distance(start) < 1e-9);
-    }
-
-    #[test]
-    fn trace_completion_requires_an_idle_report_after_the_last_ack() {
-        let (_sim, mut worker) = connected_worker();
-        let start = worker.s.status.wpos;
-        worker.trace = Some(Trace {
-            points: vec![start],
-            next: 1,
-            cursor: start,
-            buffered: VecDeque::from([TracePoint {
-                point: start,
-                target: 0,
-            }]),
-            speed: 600.0,
-            active_speed: 600.0,
-            sent: Some(Instant::now()),
-        });
-        worker.s.tracing = true;
-        worker.pending = Some(("$J=G21G90X10Y20F600".into(), Instant::now()));
+        assert_eq!(worker.queue[0], "G21G90G94M5");
+        let setup = worker.queue.pop_front().unwrap();
+        worker.pending = Some((setup, Instant::now()));
         worker.line("ok").unwrap();
-        worker.advance_trace().unwrap();
-        assert!(worker.s.tracing);
-        worker.s.status.at = Some(Instant::now());
-        worker.advance_trace().unwrap();
-        assert!(!worker.s.tracing);
+    }
+    #[test]
+    fn trace_queues_normal_g1_vertices_and_shift_only_changes_override() {
+        let (_sim, mut worker) = connected_worker();
+        start_trace(&mut worker);
+        let points = worker.trace.as_ref().unwrap().points.clone();
+        for point in &points {
+            worker.advance_trace().unwrap();
+            let command = worker.queue.pop_front().unwrap();
+            assert_eq!(
+                command.text,
+                format!("G21G90G94G1X{:.5}Y{:.5}F2400.0", point.x, point.y)
+            );
+            assert!(command.trace);
+            worker.pending = Some((command, Instant::now()));
+            worker.line("ok").unwrap();
+        }
+        let before = worker.trace.as_ref().unwrap().next;
+        worker.action(Action::TraceSpeed { boosted: true }).unwrap();
+        assert_eq!(worker.trace.as_ref().unwrap().override_percent, 100);
+        worker
+            .action(Action::TraceSpeed { boosted: false })
+            .unwrap();
+        assert_eq!(worker.trace.as_ref().unwrap().override_percent, 25);
+        assert_eq!(worker.trace.as_ref().unwrap().next, before);
+        assert!(worker.queue.is_empty());
+        assert!(!worker.s.console.iter().any(|s| s.contains("cancel jog")));
+        assert!(worker.action(Action::Feed(0x91)).is_err());
+        worker.action(Action::CancelTrace).unwrap();
+        assert!(worker.stopping.is_some());
+        assert!(worker.trace_restore.is_some());
+        assert!(worker.s.console.back().unwrap().contains("feed hold"));
     }
 
     #[test]
-    fn trace_lookahead_measures_queued_turns_instead_of_the_endpoint_chord() {
-        let point = |x, y| Point { x, y, z: 0.0 };
-        let mut trace = Trace {
-            points: vec![],
-            next: 0,
-            sent: None,
-            speed: 600.0,
-            active_speed: 600.0,
-            cursor: point(0.0, 1.0),
-            buffered: [
-                point(0.0, 0.0),
-                point(2.0, 0.0),
-                point(2.0, 1.0),
-                point(0.0, 1.0),
-            ]
-            .into_iter()
-            .enumerate()
-            .map(|(target, point)| TracePoint { point, target })
-            .collect(),
-        };
-        assert_eq!(trace.buffered_distance(point(0.0, 0.0)), 5.0);
-        assert_eq!(trace.buffered_distance(point(2.0, 0.5)), 2.5);
-        assert_eq!(trace.buffered_distance(point(1.0, 1.0)), 1.0);
-        assert_eq!(trace.buffered_distance(point(0.0, 1.0)), 0.0);
+    fn trace_completion_waits_for_physical_idle_and_confirmed_override_restoration() {
+        let (_sim, mut worker) = connected_worker();
+        start_trace(&mut worker);
+        while worker.trace.as_ref().unwrap().next < worker.trace.as_ref().unwrap().points.len() {
+            worker.advance_trace().unwrap();
+            let cmd = worker.queue.pop_front().unwrap();
+            worker.pending = Some((cmd, Instant::now()));
+            worker.line("ok").unwrap();
+        }
+        worker.advance_trace().unwrap();
+        assert!(
+            worker.trace.is_some(),
+            "An old Idle report cannot complete the trace"
+        );
+        report_stopped(
+            &mut worker,
+            Point {
+                x: 10.0,
+                y: 20.0,
+                z: 0.0,
+            },
+        );
+        worker.advance_trace().unwrap();
+        assert!(worker.trace.is_none() && worker.s.tracing);
+        worker.advance_trace_restore().unwrap();
+        while let Some(cmd) = worker.queue.pop_front() {
+            worker.pending = Some((cmd, Instant::now()));
+            worker.line("ok").unwrap();
+        }
+        worker.advance_trace_restore().unwrap();
+        worker.advance_trace_restore().unwrap();
+        assert!(worker.s.tracing && !worker.s.can_run() && !worker.s.can_manage_files());
+        worker.line("<Idle|MPos:10,20,0|Ov:100,100,100>").unwrap();
+        worker.advance_trace_restore().unwrap();
+        assert!(!worker.s.tracing && worker.trace_restore.is_none());
     }
+
     #[test]
     fn fluidnc_modal_feed_is_already_mm_per_minute_in_inch_mode() {
         let (_tx, rx) = mpsc::channel();
@@ -3229,7 +3186,12 @@ mod tests {
         let uploaded = previous.uploaded.clone();
         worker.s.program = Some(Arc::new(previous));
         worker.s.options.initial_speed = 1.0;
-        worker.action(Action::TraceHull { speed: 600.0 }).unwrap();
+        worker
+            .action(Action::TraceHull {
+                speed: 600.0,
+                boosted: false,
+            })
+            .unwrap();
         assert_eq!(worker.s.program.as_ref().unwrap().uploaded, uploaded);
         assert!(worker.s.ready && !worker.need_upload);
     }
