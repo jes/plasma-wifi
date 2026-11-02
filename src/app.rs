@@ -443,14 +443,11 @@ impl App {
         } else {
             13.0
         };
-        let mut controller = Controller::start(
+        let controller = Controller::start(
             settings.address.clone(),
             settings.http.clone(),
             (!demo).then(crate::coordinates::Coordinates::path),
         );
-        if !demo {
-            controller.enable_wifi_rescans();
-        }
         Self {
             controller,
             snapshot: Snapshot::default(),
@@ -1067,9 +1064,9 @@ impl App {
                             text.trim()
                                 .parse::<f64>()
                                 .ok()
-                                .filter(|value| value.is_finite())
+                                .filter(|value| value.is_finite() && *value > 0.0)
                         })
-                        .range(0.001..=100.0)
+                        .range(f64::MIN_POSITIVE..=f64::MAX)
                         .speed(0.1)
                         .suffix(" mm"),
                 )
@@ -1095,9 +1092,9 @@ impl App {
                             text.trim()
                                 .parse::<f64>()
                                 .ok()
-                                .filter(|value| value.is_finite())
+                                .filter(|value| value.is_finite() && *value > 0.0)
                         })
-                        .range(1.0..=3000.0)
+                        .range(f64::MIN_POSITIVE..=f64::MAX)
                         .speed(10.0)
                         .suffix(" mm/min"),
                 )
@@ -1159,7 +1156,7 @@ impl App {
         );
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new("pointer_jog"), pointer_jog));
-        ui.small("Hold Shift: ×4 jog speed (max 3000 mm/min)");
+        ui.small("Hold Shift: ×4 jog speed");
         ui.small("Tap: one increment · release hold: stop");
         ui.small("Arrow keys: X/Y · Esc: cancel jog");
         ui.small(format!(
@@ -1196,7 +1193,7 @@ impl App {
         ui.small("X/Y: edit position · G/M: console");
     }
     fn jog_feed(&self, boosted: bool) -> f64 {
-        (self.settings.jog_speed * if boosted { 4.0 } else { 1.0 }).min(3000.0)
+        self.settings.jog_speed * if boosted { 4.0 } else { 1.0 }
     }
     fn jog_input(&mut self, ctx: &egui::Context) {
         if self.snapshot.tracing {
@@ -1826,7 +1823,7 @@ impl App {
                         if !field.has_focus() { field.request_focus(); }
                     }
                 });
-                ui.small("Esc closes · Enter sends · Up/Down recall · ordinary commands need Idle/Alarm; ? ! ~ work during jobs");
+                ui.small("Esc closes · Enter sends · Up/Down recall · commands are available in every controller state");
             });
         self.console_open = open;
         if !open && let Some(id) = self.console_input_id {

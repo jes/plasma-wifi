@@ -29,7 +29,6 @@ pub enum Action {
     Stop,
     Unlock,
     Console(String),
-    WifiScanMessage(String),
     ListFiles,
     UploadFile {
         path: PathBuf,
@@ -266,16 +265,11 @@ impl Snapshot {
 #[derive(Clone, Debug)]
 struct QueuedCommand {
     text: String,
-    manual: bool,
     trace: bool,
 }
 impl From<String> for QueuedCommand {
     fn from(text: String) -> Self {
-        Self {
-            text,
-            manual: false,
-            trace: false,
-        }
+        Self { text, trace: false }
     }
 }
 impl From<&str> for QueuedCommand {
@@ -315,7 +309,6 @@ pub struct Controller {
     tx: Option<Sender<Action>>,
     shared: Arc<Mutex<Snapshot>>,
     handle: Option<thread::JoinHandle<()>>,
-    wifi_rescan: Option<crate::wifi::Rescan>,
 }
 impl Controller {
     pub fn start(address: String, http: String, coordinates_path: Option<PathBuf>) -> Self {
@@ -351,21 +344,7 @@ impl Controller {
             tx: Some(tx),
             shared,
             handle: Some(handle),
-            wifi_rescan: None,
         }
-    }
-    pub fn enable_wifi_rescans(&mut self) {
-        if self.wifi_rescan.is_some() {
-            return;
-        }
-        let state = self.shared.clone();
-        let tx = self.tx.as_ref().unwrap().clone();
-        self.wifi_rescan = Some(crate::wifi::Rescan::start(
-            move || !state.lock().unwrap().connected,
-            move |message| {
-                let _ = tx.send(Action::WifiScanMessage(message));
-            },
-        ));
     }
     pub fn send(&self, action: Action) {
         if let Some(tx) = &self.tx {
@@ -378,8 +357,6 @@ impl Controller {
 }
 impl Drop for Controller {
     fn drop(&mut self) {
-        // The WiFi helper owns an action sender; stop it before closing the queue.
-        drop(self.wifi_rescan.take());
         if let Some(tx) = self.tx.take() {
             let _ = tx.send(Action::CancelJog);
             drop(tx);
@@ -493,6 +470,11 @@ struct Worker {
     shared: Arc<Mutex<Snapshot>>,
     s: Snapshot,
     link: Option<Link>,
+    // A LocalFS Run holds its channel's acknowledgement until the job ends.
+    // Console traffic uses its own channel so it remains usable during jobs,
+    // initialization, and failed coordinate restoration without stealing acks.
+    console_link: Option<Link>,
+    console_pending: VecDeque<String>,
     queue: VecDeque<QueuedCommand>,
     pending: Option<(QueuedCommand, Instant)>,
     reconnect: Instant,
@@ -541,6 +523,8 @@ impl Worker {
             shared,
             s: Snapshot::default(),
             link: None,
+            console_link: None,
+            console_pending: VecDeque::new(),
             queue: VecDeque::new(),
             pending: None,
             reconnect: now,
@@ -661,6 +645,13 @@ impl Worker {
             if let Err(e) = self.network() {
                 self.disconnected(format!("{e:#}"));
             }
+            if let Err(e) = self.console_network() {
+                self.console_link = None;
+                self.console_pending.clear();
+                self.fail(format!(
+                    "Console connection lost; commands will not be repeated: {e:#}"
+                ));
+            }
             if let Err(e) = self.advance_pause() {
                 self.fail(format!("{e:#}"));
             }
@@ -727,6 +718,8 @@ impl Worker {
                 .log("Hull trace cancelled by disconnection; it will not restart");
         }
         self.link = None;
+        self.console_link = None;
+        self.console_pending.clear();
         self.s.connected = false;
         self.s.initialized = false;
         self.s.ready = false;
@@ -819,10 +812,7 @@ impl Worker {
             anyhow::bail!("Controller handshake timed out");
         }
         if self.pending.as_ref().is_some_and(|(cmd, t)| {
-            !cmd.manual
-                && !cmd.trace
-                && !cmd.starts_with("$LocalFS/Run=")
-                && t.elapsed() > Duration::from_secs(5)
+            !cmd.trace && !cmd.starts_with("$LocalFS/Run=") && t.elapsed() > Duration::from_secs(5)
         }) {
             anyhow::bail!("Controller command timed out; it will not be repeated");
         }
@@ -841,6 +831,7 @@ impl Worker {
                 if !self.selected_work_system && self.s.status.idle() && !self.s.job {
                     self.selected_work_system = true;
                     self.queue.push_back("G54".into());
+                    self.queue.push_back("$Report/Interval=100".into());
                     self.queue.push_back("$G".into());
                     self.s.status.wco_known = false;
                     self.s.status.position_known = false;
@@ -849,6 +840,70 @@ impl Worker {
                 }
                 if !self.s.job && self.s.phase == "Reconnecting…" {
                     self.s.phase.clear();
+                }
+            }
+        }
+        Ok(())
+    }
+    fn console_connection(&mut self) -> Result<&mut Link> {
+        if self.console_link.is_none() {
+            self.console_link = Some(Link::connect(&self.address).context("Connect console")?);
+        }
+        Ok(self.console_link.as_mut().unwrap())
+    }
+    fn console_command(&mut self, command: &str) -> Result<()> {
+        self.console_connection()?.command(command)?;
+        self.s.console(format!("> {command}"));
+        self.console_pending.push_back(command.into());
+        if command.starts_with("G10") || command == "G54" || command == "G21G54" {
+            self.s.status.wco_known = false;
+            self.s.status.position_known = false;
+        }
+        Ok(())
+    }
+    fn console_realtime(&mut self, byte: u8) -> Result<()> {
+        if self.link.is_some() {
+            self.realtime(&[byte])
+        } else {
+            self.console_connection()?.send(&[byte])?;
+            if byte != b'?' {
+                self.s.console(format!("> {} (realtime)", char::from(byte)));
+            }
+            Ok(())
+        }
+    }
+    fn console_network(&mut self) -> Result<()> {
+        let Some(link) = &mut self.console_link else {
+            return Ok(());
+        };
+        for line in link.poll()? {
+            // The new channel has its own welcome banner and acknowledgements.
+            // Neither may reset the main channel or complete its pending job.
+            if line.starts_with("[GC:") {
+                self.line(&line)?;
+            } else {
+                self.s.console(&line);
+            }
+            if (line == "ok" || line.starts_with("error:"))
+                && let Some(command) = self.console_pending.pop_front()
+            {
+                if line.starts_with("error:") {
+                    self.fail(format!("{command}: {line}"));
+                }
+                self.preview_dirty = true;
+                if self.link.is_some() {
+                    // An unchanged G10/G54 need not emit a changed-WCO report.
+                    // Refresh all status fields explicitly rather than waiting
+                    // for the sparse WCO counter while motion stays disabled.
+                    if (command.starts_with("G10")
+                        || command == "G54"
+                        || command == "G21G54"
+                        || !self.s.status.wco_known)
+                        && !self.queue.iter().any(|cmd| *cmd == "$Report/Interval=100")
+                    {
+                        self.queue.push_front("$Report/Interval=100".into());
+                    }
+                    self.realtime(b"?")?;
                 }
             }
         }
@@ -872,7 +927,11 @@ impl Worker {
                 return Ok(false);
             }
             CoordinateRecovery::Verifying(started) => {
-                if self.s.status.position_known && self.s.status.wco_known {
+                if self.s.status.at.is_some_and(|at| at > started)
+                    && self.s.status.fresh()
+                    && self.s.status.position_known
+                    && self.s.status.wco_known
+                {
                     let target = self.coordinates.get(&self.address).unwrap();
                     if self.s.status.wpos.distance(target) <= self.coordinate_tolerance() {
                         self.coordinate_recovery = CoordinateRecovery::Ready;
@@ -881,13 +940,18 @@ impl Worker {
                             .log("Work coordinates restored; toolhead assumed unmoved");
                         return Ok(true);
                     }
-                }
-                if started.elapsed() > Duration::from_secs(3) {
-                    self.coordinate_recovery = CoordinateRecovery::Failed;
-                    self.s.phase = "Coordinate restoration failed".into();
-                    self.fail(
-                        "Coordinate restoration could not be verified; reconnect to retry".into(),
-                    );
+                    // Missing/delayed reports are a transport problem, not proof
+                    // that G10 failed. Let the heartbeat reconnect on an outage;
+                    // only reject restoration when fresh coordinates disagree.
+                    if started.elapsed() > Duration::from_secs(3) {
+                        self.coordinate_recovery = CoordinateRecovery::Failed;
+                        self.s.phase = "Coordinate restoration failed".into();
+                        let actual = self.s.status.wpos;
+                        self.fail(format!(
+                            "Coordinate restoration mismatch: expected ({:.6}, {:.6}, {:.6}), reported ({:.6}, {:.6}, {:.6}) mm; reconnect to retry",
+                            target.x, target.y, target.z, actual.x, actual.y, actual.z
+                        ));
+                    }
                 }
                 return Ok(false);
             }
@@ -932,6 +996,7 @@ impl Worker {
         if !self.s.options.initial_mm {
             self.queue.push_back("G20".into());
         }
+        self.queue.push_back("$Report/Interval=100".into());
         self.queue.push_back("$G".into());
         self.preview_dirty = true;
         Ok(false)
@@ -1073,6 +1138,8 @@ impl Worker {
             self.pause = PauseState::None;
             self.queue.clear();
             self.pending = None;
+            self.console_link = None;
+            self.console_pending.clear();
             self.s.initialized = false;
             self.init_started = false;
             self.s.acceleration = [None; 2];
@@ -1229,10 +1296,6 @@ impl Worker {
                 // for the ordinary heartbeat. Auto reports also force changed WCO/Ov fields.
                 self.realtime(b"?")?;
                 self.poll = Instant::now();
-                if cmd.manual {
-                    self.preview_dirty = true;
-                    self.queue.push_back("$G".into());
-                }
             }
             if cmd == "$I" && !self.init_started {
                 self.init_started = true;
@@ -1287,7 +1350,6 @@ impl Worker {
     }
     fn action(&mut self, action: Action) -> Result<()> {
         match action {
-            Action::WifiScanMessage(message) => self.s.log(message),
             action @ (Action::ListFiles
             | Action::UploadFile { .. }
             | Action::DownloadFile { .. }) => {
@@ -1544,10 +1606,7 @@ impl Worker {
                     self.s.can_jog() && !self.s.status.torch && x.is_finite() && y.is_finite(),
                     "Jog to position requires an idle machine and finite coordinates"
                 );
-                ensure!(
-                    speed.is_finite() && (1.0..=3000.0).contains(&speed),
-                    "Invalid jog speed"
-                );
+                ensure!(speed.is_finite() && speed > 0.0, "Invalid jog speed");
                 let was_sent = self.jog.as_ref().is_some_and(|jog| jog.sent);
                 let mut jog = ManualJog::new(self.s.status.wpos, speed, Instant::now());
                 jog.go_to(Point {
@@ -1596,10 +1655,7 @@ impl Worker {
                         && self.jog.is_none(),
                     "Coordinates can only be changed while idle"
                 );
-                ensure!(
-                    !self.s.jog_restarting,
-                    "Wait for the jog speed change to finish"
-                );
+                ensure!(!self.s.jog_restarting, "Wait for the jog restart to finish");
                 ensure!(
                     !self.s.transferring,
                     "Wait for upload verification before changing coordinates"
@@ -1613,6 +1669,7 @@ impl Worker {
                 self.queue.push_back("G21G54".into());
                 self.queue
                     .push_back(format!("G10L20P1{axis}{value:.6}").into());
+                self.queue.push_back("$Report/Interval=100".into());
                 self.queue.push_back("$G".into());
                 self.s.status.wco_known = false;
                 self.s.status.position_known = false;
@@ -1645,49 +1702,21 @@ impl Worker {
                 match command {
                     "?" => {
                         self.s.console("> ?");
-                        self.realtime(b"?")?;
+                        self.console_realtime(b'?')?;
                     }
-                    "!" => {
-                        if self.trace.is_some() {
-                            return self.action(Action::CancelTrace);
-                        }
-                        if self.s.status.state == "Run" {
-                            self.s.job = true;
-                        }
-                        self.action(Action::Pause)?;
-                    }
-                    "~" => self.action(Action::Resume)?,
+                    "!" => self.console_realtime(protocol::HOLD)?,
+                    "~" => self.console_realtime(protocol::RESUME)?,
                     _ => {
                         ensure!(
-                            self.s.connected
-                                && self.s.initialized
-                                && !self.s.job
-                                && !self.s.tracing
-                                && !self.s.jog_restarting
-                                && self.jog.is_none()
-                                && !self.s.transferring
-                                && (self.s.status.idle() || self.s.status.state.contains("Alarm")),
-                            "Ordinary console commands require an idle or alarmed controller; ? ! ~ remain available during jobs"
+                            command.bytes().all(|b| (32..=126).contains(&b)),
+                            "Enter one ASCII command line"
                         );
-                        ensure!(
-                            command.is_ascii()
-                                && !command.bytes().any(|b| b < 32)
-                                && !command.contains(['?', '!', '~']),
-                            "Send one command at a time; realtime controls must be sent separately"
-                        );
-                        self.queue.push_back(QueuedCommand {
-                            text: command.into(),
-                            manual: true,
-                            trace: false,
-                        });
+                        self.console_command(command)?;
                     }
                 }
             }
             Action::JogSpeed { speed } => {
-                ensure!(
-                    speed.is_finite() && (1.0..=3000.0).contains(&speed),
-                    "Invalid jog speed"
-                );
+                ensure!(speed.is_finite() && speed > 0.0, "Invalid jog speed");
                 self.change_jog_speed(speed)?;
             }
             Action::TraceSpeed { boosted } => {
@@ -1714,7 +1743,7 @@ impl Worker {
                 );
                 ensure!(self.jog.is_none(), "Wait for manual jogging to finish");
                 ensure!(
-                    speed.is_finite() && (1.0..=3000.0).contains(&speed),
+                    speed.is_finite() && speed > 0.0 && (speed * 4.0).is_finite(),
                     "Invalid trace speed"
                 );
                 let original = &self
@@ -1836,21 +1865,14 @@ impl Worker {
         Ok(())
     }
     fn change_jog_speed(&mut self, speed: f64) -> Result<()> {
-        let mut changed = false;
-        let mut sent = false;
         if let Some(jog) = &mut self.jog {
-            changed |= jog.speed != speed;
-            sent |= jog.sent;
             jog.speed = speed;
         }
-        if !changed || !sent || self.jog_restart.is_some() {
-            return Ok(());
-        }
-        self.begin_jog_restart()
+        Ok(())
     }
     fn begin_jog_restart(&mut self) -> Result<()> {
-        // $J ignores feed overrides in FluidNC. Interrupt its planner now;
-        // changing future F words alone would leave the old buffer running.
+        // A direction change or held release must discard the old travel.
+        // Speed changes alone keep the planner running and update future F words.
         self.queue.retain(|cmd| !cmd.starts_with("$J="));
         self.realtime(&[protocol::JOG_CANCEL])?;
         self.jog_restart = Some(JogRestart {
@@ -1876,9 +1898,9 @@ impl Worker {
             self.s.tracing = false;
             self.jog_restart = None;
             self.s.jog_restarting = false;
-            self.s.phase = "Jog speed change cancelled".into();
+            self.s.phase = "Jog restart cancelled".into();
             self.realtime(&[protocol::JOG_CANCEL])?;
-            anyhow::bail!("Jog speed change timed out; motion cancelled");
+            anyhow::bail!("Jog restart timed out; motion cancelled");
         }
         if self.pending.is_some() || !self.s.connected {
             return Ok(());
@@ -1929,9 +1951,9 @@ impl Worker {
         );
         ensure!(
             speed.is_finite()
-                && (1.0..=3000.0).contains(&speed)
+                && speed > 0.0
                 && step.is_finite()
-                && (0.001..=100.0).contains(&step)
+                && step > 0.0
                 && directions.iter().all(|d| (-1..=1).contains(d)),
             "Invalid jog input"
         );
@@ -1941,7 +1963,6 @@ impl Worker {
             .get_or_insert_with(|| ManualJog::new(self.s.status.wpos, speed, now));
         jog.observe(self.s.status.wpos, now);
         let changed = jog.input(directions, presses, step, now);
-        let speed_changed = jog.speed != speed;
         jog.speed = speed;
         if changed && !jog.sent {
             // Nothing has entered the jog queue yet, so apply held-release
@@ -1950,7 +1971,7 @@ impl Worker {
             jog.rebase(self.s.status.wpos, now);
             jog.sent = false;
         }
-        if (changed || speed_changed) && jog.sent && self.jog_restart.is_none() {
+        if changed && jog.sent && self.jog_restart.is_none() {
             self.begin_jog_restart()?;
         }
         self.preview_dirty = true;
@@ -2119,11 +2140,7 @@ impl Worker {
         Ok(Instant::now())
     }
     fn queue_trace(&mut self, text: String) {
-        self.queue.push_back(QueuedCommand {
-            text,
-            manual: false,
-            trace: true,
-        });
+        self.queue.push_back(QueuedCommand { text, trace: true });
     }
     fn advance_trace_restore(&mut self) -> Result<()> {
         let Some(restore) = &self.trace_restore else {
@@ -2896,7 +2913,7 @@ mod tests {
                 })
                 .is_err()
         );
-        assert!(worker.action(Action::Console("G0X100".into())).is_err());
+        worker.action(Action::Console("$G".into())).unwrap();
         assert!(worker.action(Action::ListFiles).is_err());
         assert!(
             worker
@@ -2942,7 +2959,7 @@ mod tests {
             .unwrap();
     }
     #[test]
-    fn shift_cancels_pending_jog_and_preserves_unfinished_increment() {
+    fn shift_updates_future_jog_feeds_without_cancel_or_rebasing() {
         let (_sim, mut worker) = connected_worker();
         worker
             .action(Action::Jog {
@@ -2956,13 +2973,16 @@ mod tests {
         let cmd = worker.queue.pop_front().unwrap();
         worker.pending = Some((cmd, Instant::now()));
         worker.action(Action::JogSpeed { speed: 2400.0 }).unwrap();
-        assert!(worker.s.console.back().unwrap().contains("cancel jog"));
-        worker.advance_jog_restart().unwrap();
-        assert!(worker.jog_restart.as_ref().unwrap().fence.is_none());
+        assert!(worker.jog_restart.is_none());
+        assert!(
+            !worker
+                .s
+                .console
+                .iter()
+                .any(|line| line.contains("cancel jog"))
+        );
+        assert!(worker.pending.as_ref().unwrap().0.ends_with("F600.0"));
         worker.line("ok").unwrap();
-        worker.advance_jog_restart().unwrap();
-        worker.advance_jog_restart().unwrap();
-        assert!(worker.s.jog_restarting);
         report_stopped(
             &mut worker,
             Point {
@@ -2971,14 +2991,19 @@ mod tests {
                 z: 0.0,
             },
         );
-        worker.advance_jog_restart().unwrap();
         worker.advance_jog().unwrap();
-        assert_eq!(
-            worker.queue.pop_front().unwrap(),
-            "$J=G21G90X14.40000Y20.00000F2400.0"
-        );
+        let command = worker.queue.pop_front().unwrap();
+        assert!(command.ends_with("F2400.0"));
         assert_eq!(worker.jog.as_ref().unwrap().target.x, 110.0);
         worker.action(Action::JogSpeed { speed: 600.0 }).unwrap();
+        assert!(worker.jog_restart.is_none());
+        assert!(
+            !worker
+                .s
+                .console
+                .iter()
+                .any(|line| line.contains("cancel jog"))
+        );
         worker.action(Action::CancelJog).unwrap();
         report_stopped(
             &mut worker,
@@ -2991,6 +3016,98 @@ mod tests {
         worker.advance_jog_restart().unwrap();
         worker.advance_jog().unwrap();
         assert!(worker.jog.is_none() && worker.queue.is_empty());
+    }
+
+    #[test]
+    fn jog_input_speed_changes_allow_high_feeds_without_cancelling() {
+        let (_sim, mut worker) = connected_worker();
+        for (speed, presses) in [(6000.0, [1, 0]), (24000.0, [0, 0]), (6000.0, [0, 0])] {
+            worker.jog_input([1, 0], presses, speed, 200.0).unwrap();
+            worker.advance_jog().unwrap();
+            worker.queue.clear();
+            assert_eq!(worker.jog.as_ref().unwrap().speed, speed);
+            assert!(worker.jog_restart.is_none());
+        }
+        assert!(
+            !worker
+                .s
+                .console
+                .iter()
+                .any(|line| line.contains("cancel jog"))
+        );
+        for speed in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            assert!(worker.action(Action::JogSpeed { speed }).is_err());
+        }
+    }
+
+    #[test]
+    fn restoration_waits_for_fresh_post_write_evidence_instead_of_failing_on_silence() {
+        let (_sim, mut worker) = connected_worker();
+        let target = Point {
+            x: 42.0,
+            y: 25.0,
+            z: 0.0,
+        };
+        worker.coordinates.record(&worker.address, target).unwrap();
+        let started = Instant::now() - Duration::from_secs(3);
+        worker.coordinate_recovery = CoordinateRecovery::Verifying(started);
+        worker.s.status.at = Some(started - Duration::from_millis(1));
+        assert!(!worker.recover_coordinates().unwrap());
+        assert!(matches!(
+            worker.coordinate_recovery,
+            CoordinateRecovery::Verifying(_)
+        ));
+        assert!(worker.s.error.is_none());
+        worker.s.status.position_known = false;
+        worker.s.status.at = Some(Instant::now());
+        assert!(!worker.recover_coordinates().unwrap());
+        assert!(worker.s.error.is_none());
+        worker.line("<Idle|MPos:10,20,0|WCO:-32,-5,0>").unwrap();
+        assert!(worker.recover_coordinates().unwrap());
+    }
+
+    #[test]
+    fn console_stays_available_in_all_states_and_cannot_consume_main_channel_ack() {
+        let (_sim, mut worker) = connected_worker();
+        worker.s.initialized = false;
+        worker.coordinate_recovery = CoordinateRecovery::Failed;
+        worker.s.job = true;
+        worker.s.tracing = true;
+        worker.s.transferring = true;
+        worker.s.jog_restarting = true;
+        worker.pending = Some(("$LocalFS/Run=plasma.nc".into(), Instant::now()));
+        for state in [
+            "Idle", "Run", "Jog", "Hold:0", "Hold:1", "Alarm", "Door:0", "Sleep",
+        ] {
+            worker.s.status.state = state.into();
+            worker.action(Action::Console("$G".into())).unwrap();
+            worker.action(Action::Console("!".into())).unwrap();
+            worker.action(Action::Console("~".into())).unwrap();
+            worker.action(Action::Console("?".into())).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !worker.console_pending.is_empty() {
+            worker.console_network().unwrap();
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(worker.s.job);
+        assert!(
+            worker
+                .pending
+                .as_ref()
+                .unwrap()
+                .0
+                .starts_with("$LocalFS/Run=")
+        );
+        assert!(matches!(
+            worker.coordinate_recovery,
+            CoordinateRecovery::Failed
+        ));
+        worker.s.tracing = false;
+        worker.action(Action::Console("!".into())).unwrap();
+        worker.action(Action::Console("~".into())).unwrap();
+        worker.action(Action::Console("?".into())).unwrap();
     }
     fn start_trace(worker: &mut Worker) {
         worker.s.program = Some(Arc::new(

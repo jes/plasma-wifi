@@ -590,6 +590,8 @@ fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()
     let mut last_report = Instant::now();
     let mut last_report_state = String::new();
     let mut last_modal = String::new();
+    let mut run_pending = false;
+    let mut full_report = false;
     loop {
         {
             let mut m = state.lock().unwrap();
@@ -604,13 +606,18 @@ fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()
             // FluidNC auto-reports periodically during motion, but in Idle only
             // reports changes. Explicit ? queries still produce sparse reports.
             if interval.is_some_and(|interval| {
-                m.report_wco != m.wco
+                full_report
+                    || m.report_wco != m.wco
                     || m.report_feed != m.feed
                     || m.report_torch != m.torch
                     || m.state() != last_report_state
                     || matches!(m.state(), "Run" | "Jog" | "Hold:1")
                         && last_report.elapsed() >= interval
             }) {
+                if full_report {
+                    m.report_count = 0;
+                    full_report = false;
+                }
                 stream.write_all(m.status(interval.is_some()).as_bytes())?;
                 last_report_state = m.state().into();
                 last_report = Instant::now();
@@ -622,9 +629,10 @@ fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()
                     last_modal = modal;
                 }
             }
-            if m.complete {
+            if m.complete && run_pending {
                 stream.write_all(b"ok\n")?;
                 m.complete = false;
+                run_pending = false;
             }
         }
         let count = match stream.read(&mut buffer) {
@@ -664,6 +672,7 @@ fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()
                     }
                 }
                 0x18 => {
+                    run_pending = false;
                     let abort = matches!(m.state(), "Run" | "Jog" | "Hold:1");
                     if abort {
                         m.alarm = Some(3);
@@ -702,8 +711,13 @@ fn telnet_client(mut stream: TcpStream, state: Arc<Mutex<Machine>>) -> Result<()
                         .and_then(|v| v.parse::<u64>().ok())
                     {
                         interval = (value > 0).then(|| Duration::from_millis(value));
+                        full_report = value > 0;
                     }
-                    stream.write_all(m.command(&command).as_bytes())?;
+                    let reply = m.command(&command);
+                    if command.starts_with("$LocalFS/Run=") && reply.is_empty() {
+                        run_pending = true;
+                    }
+                    stream.write_all(reply.as_bytes())?;
                 }
                 b'\r' => {}
                 _ => line.push(byte),
@@ -1525,7 +1539,7 @@ mod tests {
         assert_eq!(s.progress, 1.0);
     }
     #[test]
-    fn jog_speed_changes_resume_the_original_target_without_changing_job_override() {
+    fn jog_speed_changes_keep_moving_without_cancellation_or_changing_job_override() {
         let sim = Simulator::start().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
@@ -1561,13 +1575,8 @@ mod tests {
         });
         assert!((done.status.feed_override - 1.1).abs() < 0.001);
         assert!(!done.status.torch && done.alarm.is_none());
-        assert!(
-            done.console
-                .iter()
-                .filter(|s| s.contains("cancel jog"))
-                .count()
-                >= 2
-        );
+        assert!(!done.console.iter().any(|s| s.contains("cancel jog")));
+        assert_eq!(sim.machine.lock().unwrap().jog_cancel_count, 0);
     }
 
     #[test]
@@ -1828,12 +1837,57 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("G10L20P1X42") || l == "ok")
         );
+        // Repeating the same offset edit does not trigger FluidNC's changed-WCO
+        // auto report. We must still obtain fresh offsets without a long wait.
+        let before = sim.commands().len();
+        let started = Instant::now();
+        controller.send(Action::Console("G10L20P1X42".into()));
+        wait(&controller, |s| {
+            s.status.position_known
+                && s.status.wco_known
+                && sim.commands()[before..]
+                    .iter()
+                    .any(|cmd| cmd == "$Report/Interval=100")
+        });
+        assert!(started.elapsed() < Duration::from_millis(500));
         let started = Instant::now();
         controller.send(Action::Feed(0x91));
         wait(&controller, |s| {
             (s.status.feed_override - 1.1).abs() < 0.001
         });
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+    #[test]
+    fn console_replies_and_errors_leave_job_completion_on_its_own_channel() {
+        let sim = Simulator::start().unwrap();
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
+        wait(&controller, |s| s.initialized);
+        controller.send(Action::Load {
+            name: "console-job.nc".into(),
+            text: "G21G90\nG1X20F600\nM30".into(),
+        });
+        wait(&controller, |s| s.can_run());
+        controller.send(Action::Run);
+        wait(&controller, |s| s.status.state == "Run");
+        controller.send(Action::Console("$G".into()));
+        controller.send(Action::Console("G21G90G94G1X999F600".into()));
+        let running = wait(&controller, |s| {
+            s.error
+                .as_ref()
+                .is_some_and(|error| error.contains("error:8"))
+        });
+        assert!(running.job);
+        assert_eq!(running.status.state, "Run");
+        let done = wait(&controller, |s| s.phase == "Completed");
+        assert!(!done.job && done.status.wpos.x >= 19.0);
+        assert!(!done.console.iter().any(|line| line.contains("soft reset")));
+        assert_eq!(
+            sim.commands()
+                .iter()
+                .filter(|cmd| cmd.starts_with("$LocalFS/Run="))
+                .count(),
+            1
+        );
     }
     #[test]
     fn normal_stop_avoids_abort_alarm_and_unlock_clears_alarm_message() {
@@ -1849,13 +1903,12 @@ mod tests {
         wait(&controller, |s| s.status.state == "Run" && s.status.torch);
         controller.send(Action::Console("$G".into()));
         wait(&controller, |s| {
-            s.error
-                .as_ref()
-                .is_some_and(|e| e.contains("Ordinary console commands"))
+            s.console.iter().any(|line| line == "> $G")
+                && s.console.iter().rev().take(3).any(|line| line == "ok")
         });
         assert!(
             controller.snapshot().job,
-            "A rejected console command must not end a job"
+            "The console acknowledgement must not end the running job"
         );
         controller.send(Action::Stop);
         wait(&controller, |s| s.initialized && !s.job && s.status.idle());
