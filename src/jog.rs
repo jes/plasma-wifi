@@ -125,6 +125,9 @@ impl Axis {
 pub struct ManualJog {
     pub axes: [Axis; 2],
     pub speed: f64,
+    pub nominal_feed: f64,
+    pub use_override: bool,
+    pub boosted: bool,
     pub active_speed: f64,
     pub cursor: Point,
     pub target: Point,
@@ -138,6 +141,9 @@ impl ManualJog {
         Self {
             axes: [Axis::new(position.x, now), Axis::new(position.y, now)],
             speed,
+            nominal_feed: speed,
+            use_override: false,
+            boosted: false,
             active_speed: speed,
             cursor: position,
             target: position,
@@ -149,6 +155,15 @@ impl ManualJog {
     }
     pub fn directions(&self) -> [i8; 2] {
         [self.axes[0].direction, self.axes[1].direction]
+    }
+    pub fn set_speed(&mut self, base: f64, boosted: bool) {
+        self.boosted = boosted;
+        self.speed = base * if boosted { 4.0 } else { 1.0 };
+        self.nominal_feed = if self.use_override {
+            base * 4.0
+        } else {
+            self.speed
+        };
     }
     pub fn released(&self) -> bool {
         self.directions() == [0, 0]

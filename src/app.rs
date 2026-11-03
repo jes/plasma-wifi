@@ -1006,7 +1006,14 @@ impl App {
             .show(ui, |ui| self.motion_controls(ui, columns));
     }
     fn motion_controls(&mut self, ui: &mut egui::Ui, columns: egui::emath::Rangef) {
-        ui.label(RichText::new("FEED OVERRIDE").strong());
+        ui.label(
+            RichText::new(if self.snapshot.jog_override_active {
+                "JOG FEED OVERRIDE"
+            } else {
+                "FEED OVERRIDE"
+            })
+            .strong(),
+        );
         ui.label(
             RichText::new(format!(
                 "{:.0}%",
@@ -1029,7 +1036,12 @@ impl App {
                     button
                 };
                 if ui
-                    .add_enabled(self.snapshot.connected && !self.snapshot.tracing, button)
+                    .add_enabled(
+                        self.snapshot.connected
+                            && !self.snapshot.tracing
+                            && !self.snapshot.jog_override_active,
+                        button,
+                    )
                     .clicked()
                 {
                     self.controller.send(Action::Feed(byte));
@@ -1177,6 +1189,8 @@ impl App {
                 self.snapshot.can_jog()
                     && self.snapshot.status.idle()
                     && !self.snapshot.jog_restarting
+                    && !self.snapshot.jog_override_active
+                    && !self.snapshot.jog_detecting
                     && self.snapshot.program.is_some()
                     && !self.snapshot.status.torch,
                 egui::Button::new("Trace hull at jog speed"),
@@ -1192,9 +1206,6 @@ impl App {
         }
         ui.small("X/Y: edit position · G/M: console");
     }
-    fn jog_feed(&self, boosted: bool) -> f64 {
-        self.settings.jog_speed * if boosted { 4.0 } else { 1.0 }
-    }
     fn jog_input(&mut self, ctx: &egui::Context) {
         if self.snapshot.tracing {
             self.controller.send(Action::TraceSpeed {
@@ -1203,7 +1214,8 @@ impl App {
         }
         if self.snapshot.status.state == "Jog" || self.snapshot.jog_restarting {
             self.controller.send(Action::JogSpeed {
-                speed: self.jog_feed(ctx.input(|input| input.focused && input.modifiers.shift)),
+                speed: self.settings.jog_speed,
+                boosted: ctx.input(|input| input.focused && input.modifiers.shift),
             });
         }
         let pointer = ctx
@@ -1291,7 +1303,8 @@ impl App {
             self.controller.send(Action::JogInput {
                 directions,
                 presses,
-                speed: self.jog_feed(boosted),
+                speed: self.settings.jog_speed,
+                boosted,
                 step: self.settings.jog_increment,
             });
             self.was_jogging = directions != [0, 0];
@@ -1372,7 +1385,8 @@ impl App {
             self.controller.send(Action::JogTo {
                 x: center.x + ((pointer.x - rect.center().x - self.pan.x) / scale) as f64,
                 y: center.y - ((pointer.y - rect.center().y - self.pan.y) / scale) as f64,
-                speed: self.jog_feed(ui.input(|i| i.modifiers.shift)),
+                speed: self.settings.jog_speed,
+                boosted: ui.input(|i| i.modifiers.shift),
             });
         }
         response.on_hover_text("Ctrl-click: jog to this work position · drag: pan · wheel: zoom");

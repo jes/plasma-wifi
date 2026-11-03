@@ -196,10 +196,10 @@ try:
     command("key", "Right")
     changed = wait(lambda s: s["state"] == "Idle" and abs(s["mpos_x"] - before["mpos_x"] - 0.25) < 0.001,
                    "I shortcut did not set the increment, or accepted /2")
-    assert [c for c in changed["commands"] if c.startswith("$J=")][-1].endswith("F400.0"), "F shortcut did not set jog feed, or accepted /2"
+    assert [c for c in changed["commands"] if c.startswith("$J=")][-1].endswith("F1600.0P1"), "F shortcut did not set jog feed, or accepted /2"
     # Feed entry and Shift boosting must have no fixed 3000 mm/min UI cap.
     edit_shortcut("f", "5000")
-    for key, feed in [("Right", "F5000.0"), ("shift+Right", "F20000.0")]:
+    for key, feed in [("Right", "F20000.0P1"), ("shift+Right", "F20000.0P1")]:
         before = state()
         command("key", key)
         moved = wait(lambda s: s["state"] == "Idle" and abs(s["x"] - before["x"] - 0.25) < 0.001,
@@ -276,22 +276,22 @@ try:
     command("key", "shift+Right")
     rapid = wait(lambda s: s["state"] == "Idle" and abs(s["mpos_x"] - before["mpos_x"] - 1) < 0.001,
                  "Shift+arrow did not jog one increment")
-    assert any(c.startswith("$J=") and c.endswith("F2400.0") for c in rapid["commands"][len(before["commands"]):]), "Shift did not multiply keyboard jog feed"
+    assert any(c.startswith("$J=") and c.endswith("F2400.0P1") for c in rapid["commands"][len(before["commands"]):]), "Shift did not multiply keyboard jog feed"
 
     # Shift also changes speed during a held mouse jog, without pointer movement.
     baseline = len(state()["commands"])
     cancellations = state()["jog_cancel_count"]
     command("mousemove", "--window", window, 225, 751, "mousedown", 1)
-    wait(lambda s: any(c.startswith("$J=") and c.endswith("F600.0") for c in s["commands"][baseline:]), "Held mouse jog did not start")
+    wait(lambda s: s["state"] == "Jog" and abs(s["feed_override"] - 0.25) < 0.001 and any(c.startswith("$J=") and c.endswith("F2400.0P1") for c in s["commands"][baseline:]), "Held mouse jog did not start")
     baseline = len(state()["commands"])
     command("keydown", "Shift_L")
-    wait(lambda s: any(c.startswith("$J=") and c.endswith("F2400.0") for c in s["commands"][baseline:]), "Shift did not boost held mouse jog")
+    wait(lambda s: s["state"] == "Jog" and abs(s["feed_override"] - 1.0) < 0.001 and s["velocity"] > 600, "Shift did not boost held mouse jog")
     baseline = len(state()["commands"])
     command("keyup", "Shift_L")
-    wait(lambda s: any(c.startswith("$J=") and c.endswith("F600.0") for c in s["commands"][baseline:]), "Releasing Shift did not slow held mouse jog")
+    wait(lambda s: s["state"] == "Jog" and abs(s["feed_override"] - 0.25) < 0.001 and s["velocity"] <= 600, "Releasing Shift did not slow held mouse jog")
     assert state()["jog_cancel_count"] == cancellations, "Shift speed change cancelled jogging"
     command("mouseup", 1)
-    wait(lambda s: s["state"] == "Idle", "Mouse release did not finish jogging")
+    wait(lambda s: s["state"] == "Idle" and abs(s["feed_override"] - 1.0) < 0.001, "Mouse release did not stop jogging and restore feed override")
     time.sleep(0.3)  # Receive Idle and enable Run in the UI before clicking.
 
     click(55, 298)  # Run

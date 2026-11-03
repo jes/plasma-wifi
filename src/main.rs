@@ -5,6 +5,7 @@ mod desktop;
 mod file_dialog;
 mod gcode;
 mod jog;
+mod jog_override;
 mod protocol;
 mod simulator;
 mod trace;

@@ -23,10 +23,13 @@ struct StreamMove {
 struct JogMove {
     target: Point,
     feed: f64,
+    use_override: bool,
 }
 
 #[derive(Default)]
 struct Machine {
+    jog_override_supported: bool,
+    jog_probe_error: Option<u8>,
     file: String,
     files: BTreeMap<String, Vec<u8>>,
     program: Option<Program>,
@@ -299,7 +302,7 @@ impl Machine {
         let desired = if self.jog_cancelling {
             0.0
         } else {
-            (first.feed / 60.0)
+            (first.feed * if first.use_override { self.feed } else { 1.0 } / 60.0)
                 .min(50.0 / dx.abs().max(dy.abs()).max(1e-9))
                 .min((2.0 * acceleration * remaining).sqrt())
         };
@@ -402,6 +405,19 @@ impl Machine {
             });
         }
         if command.starts_with("$J=") {
+            if command == crate::jog_override::PROBE
+                && let Some(error) = self.jog_probe_error
+            {
+                return format!("error:{error}\n");
+            }
+            if let Some(value) = word(command, 'P') {
+                if !self.jog_override_supported {
+                    return "error:36\n".into();
+                }
+                if value != 0.0 && value != 1.0 {
+                    return "error:3\n".into();
+                }
+            }
             if self.program.is_some() || self.held {
                 return "error:8\n".into();
             }
@@ -435,6 +451,7 @@ impl Machine {
                 self.jogs.push_back(JogMove {
                     target,
                     feed: word(command, 'F').unwrap_or(600.0),
+                    use_override: word(command, 'P') == Some(1.0),
                 });
             }
         }
@@ -491,11 +508,19 @@ pub struct Simulator {
 }
 impl Simulator {
     pub fn start() -> Result<Self> {
+        Self::start_with_jog_override(true)
+    }
+    #[cfg(test)]
+    pub fn legacy() -> Result<Self> {
+        Self::start_with_jog_override(false)
+    }
+    fn start_with_jog_override(jog_override_supported: bool) -> Result<Self> {
         let telnet = TcpListener::bind("127.0.0.1:0")?;
         let http = TcpListener::bind("127.0.0.1:0")?;
         let address = telnet.local_addr()?.to_string();
         let http_url = format!("http://{}", http.local_addr()?);
         let machine = Arc::new(Mutex::new(Machine {
+            jog_override_supported,
             feed: 1.0,
             rapid: 1.0,
             files: BTreeMap::from([(
@@ -890,7 +915,7 @@ mod tests {
     #[test]
     fn held_release_stops_a_large_increment_without_resuming_it() {
         for speed in [600.0, 2400.0] {
-            let sim = Simulator::start().unwrap();
+            let sim = Simulator::legacy().unwrap();
             let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
             wait(&controller, |s| s.initialized && s.can_jog());
             controller.send(Action::JogInput {
@@ -898,6 +923,7 @@ mod tests {
                 presses: [1, 0],
                 speed,
                 step: 100.0,
+                boosted: false,
             });
             let holding = Instant::now();
             while holding.elapsed() < Duration::from_millis(450) {
@@ -906,6 +932,7 @@ mod tests {
                     presses: [0, 0],
                     speed,
                     step: 100.0,
+                    boosted: false,
                 });
                 thread::sleep(Duration::from_millis(20));
             }
@@ -919,6 +946,7 @@ mod tests {
                 presses: [0, 0],
                 speed,
                 step: 100.0,
+                boosted: false,
             });
             while sim.machine.lock().unwrap().jog_cancel_count == before_cancel {
                 assert!(
@@ -942,7 +970,7 @@ mod tests {
 
     #[test]
     fn readouts_follow_auto_modal_reports_and_realtime_feed() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.modal.contains("G90"));
         let queries = sim
@@ -1053,7 +1081,7 @@ mod tests {
     #[test]
     fn coordinates_survive_every_app_and_firmware_restart_combination() {
         for (restart_app, reboot) in [(true, false), (true, true), (false, true), (false, false)] {
-            let sim = Simulator::start().unwrap();
+            let sim = Simulator::legacy().unwrap();
             let checkpoint = CheckpointFile::new();
             let target = seed_position(&sim);
             let controller = checkpoint.start(&sim);
@@ -1114,7 +1142,8 @@ mod tests {
                 .filter(|c| c.starts_with("G10"))
                 .count();
             assert_eq!(writes, usize::from(reboot));
-            assert!(!commands[baseline..].iter().any(|c| c.starts_with("$J=")
+            assert!(!commands[baseline..].iter().any(|c| (c.starts_with("$J=")
+                && c.as_str() != crate::jog_override::PROBE)
                 || c.starts_with("$LocalFS/Run=")
                 || c.starts_with("G0")
                 || c.starts_with("G1") && !c.starts_with("G10")));
@@ -1125,24 +1154,28 @@ mod tests {
         }
     }
     #[test]
-    fn reboot_banner_on_existing_link_discards_cached_coordinates() {
-        let sim = Simulator::start().unwrap();
+    fn reset_banner_on_existing_link_uses_live_coordinates_without_restoring_checkpoint() {
+        let sim = Simulator::legacy().unwrap();
         let checkpoint = CheckpointFile::new();
         let target = seed_position(&sim);
         let controller = checkpoint.start(&sim);
         restored(&controller, target);
         let count = sim.commands().len();
         sim.reboot(false);
-        wait(&controller, |s| {
-            sim.commands()[count..].iter().any(|c| c.starts_with("G10")) && s.initialized
+        let s = wait(&controller, |s| {
+            s.initialized
+                && s.status.position_known
+                && s.status.mpos.distance(Point::default()) < 0.001
         });
-        let s = restored(&controller, target);
-        assert!(s.status.mpos.distance(Point::default()) < 0.001);
-        assert!(checkpoint.saved(&sim).unwrap().distance(target) < 1e-9);
+        assert!(!sim.commands()[count..].iter().any(|c| c.starts_with("G10")));
+        let live = sim.machine.lock().unwrap().position;
+        assert!(s.status.wpos.distance(live) < 0.001);
+        assert!(s.status.wpos.distance(target) > 1.0);
+        assert!(checkpoint.saved(&sim).unwrap().distance(live) < 0.001);
     }
     #[test]
     fn restoration_with_sparse_idle_reports_enables_jogging_without_stop() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let checkpoint = CheckpointFile::new();
         let target = seed_position(&sim);
         let controller = checkpoint.start(&sim);
@@ -1165,7 +1198,7 @@ mod tests {
     }
     #[test]
     fn inch_reports_and_modal_units_survive_coordinate_restoration() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let checkpoint = CheckpointFile::new();
         let target = seed_position(&sim);
         let controller = checkpoint.start(&sim);
@@ -1185,7 +1218,7 @@ mod tests {
     }
     #[test]
     fn alarm_waits_for_explicit_unlock_before_restoration() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let checkpoint = CheckpointFile::new();
         let target = seed_position(&sim);
         let controller = checkpoint.start(&sim);
@@ -1211,7 +1244,7 @@ mod tests {
     #[test]
     fn rejected_or_unverified_restoration_preserves_checkpoint_and_blocks_motion() {
         for rejected in [true, false] {
-            let sim = Simulator::start().unwrap();
+            let sim = Simulator::legacy().unwrap();
             let checkpoint = CheckpointFile::new();
             let target = seed_position(&sim);
             let controller = checkpoint.start(&sim);
@@ -1232,7 +1265,7 @@ mod tests {
     }
     #[test]
     fn app_restart_during_running_job_keeps_live_coordinates() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let checkpoint = CheckpointFile::new();
         let controller = checkpoint.start(&sim);
         wait(&controller, |s| s.initialized && s.status.position_known);
@@ -1256,8 +1289,8 @@ mod tests {
     }
     #[test]
     fn changing_controller_does_not_restore_another_machines_position() {
-        let sim = Simulator::start().unwrap();
-        let other = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
+        let other = Simulator::legacy().unwrap();
         let checkpoint = CheckpointFile::new();
         let target = seed_position(&sim);
         let controller = checkpoint.start(&sim);
@@ -1282,7 +1315,7 @@ mod tests {
     }
     #[test]
     fn full_upload_run_pause_restore_stop_and_reconnect() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized);
         controller.send(Action::Load {
@@ -1322,8 +1355,62 @@ mod tests {
         assert!(!stopped.status.torch);
     }
     #[test]
+    fn stopping_running_or_paused_job_preserves_origin_without_coordinate_restoration() {
+        for paused in [false, true] {
+            let sim = Simulator::legacy().unwrap();
+            let checkpoint = CheckpointFile::new();
+            let start = seed_position(&sim);
+            let origin = sim.machine.lock().unwrap().wco;
+            let controller = checkpoint.start(&sim);
+            restored(&controller, start);
+            controller.send(Action::Load {
+                name: "stop-origin.nc".into(),
+                text: "G21G90G54\nM3S1\nG1X300Y100F600\nM5\nM30".into(),
+            });
+            wait(&controller, |s| s.can_run());
+            controller.send(Action::Run);
+            wait(&controller, |s| {
+                s.status.state == "Run" && s.status.wpos.distance(start) > 1.0
+            });
+            if paused {
+                controller.send(Action::Pause);
+                wait(&controller, |s| s.phase == "Paused · torch off");
+            }
+            let before = sim.commands().len();
+            controller.send(Action::Stop);
+            let stopped = wait(&controller, |s| s.initialized && !s.job && s.status.idle());
+            let position = {
+                let machine = sim.machine.lock().unwrap();
+                assert_eq!(machine.wco, origin, "Stop must preserve the work origin");
+                assert!(!machine.torch && machine.alarm.is_none());
+                machine.position
+            };
+            assert!(stopped.status.wpos.distance(position) < 0.001);
+            assert!(checkpoint.saved(&sim).unwrap().distance(position) < 0.001);
+            assert!(
+                !sim.commands()[before..]
+                    .iter()
+                    .any(|cmd| cmd.starts_with("G10")),
+                "Stopping a job must not write coordinate offsets"
+            );
+            // A later connection uses the checkpoint from the actual stop,
+            // rather than moving the origin back to an earlier motion report.
+            drop(controller);
+            let before = sim.commands().len();
+            let controller = checkpoint.start(&sim);
+            restored(&controller, position);
+            assert_eq!(sim.machine.lock().unwrap().wco, origin);
+            assert!(
+                !sim.commands()[before..]
+                    .iter()
+                    .any(|cmd| cmd.starts_with("G10"))
+            );
+        }
+    }
+
+    #[test]
     fn jog_cancel_and_dro_do_not_move_machine_coordinates() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Jog {
@@ -1349,7 +1436,7 @@ mod tests {
     }
     #[test]
     fn reconnect_while_paused_retains_torch_restore_intent() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Load {
@@ -1375,7 +1462,7 @@ mod tests {
     }
     #[test]
     fn completion_after_reconnect_does_not_wait_for_the_lost_run_ack() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Load {
@@ -1400,7 +1487,7 @@ mod tests {
     }
     #[test]
     fn verification_catches_same_length_corruption() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let data = "N1G0X1\n";
         protocol::upload(&sim.http, data, |_| {}).unwrap();
         sim.machine.lock().unwrap().file = "N1G0X9\n".into();
@@ -1408,7 +1495,7 @@ mod tests {
     }
     #[test]
     fn arbitrary_controller_files_round_trip_binary_names_and_empty_files() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let scratch = CheckpointFile::new();
         let folder = scratch.0.parent().unwrap();
         std::fs::create_dir_all(folder).unwrap();
@@ -1442,7 +1529,7 @@ mod tests {
 
     #[test]
     fn config_transfers_preserve_the_loaded_job_and_work_in_alarm() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Load {
@@ -1504,7 +1591,7 @@ mod tests {
 
     #[test]
     fn replacing_plasma_through_files_invalidates_the_selected_job() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Load {
@@ -1525,7 +1612,7 @@ mod tests {
     }
     #[test]
     fn completion_ack_handles_jobs_shorter_than_status_poll_interval() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Load {
@@ -1540,7 +1627,7 @@ mod tests {
     }
     #[test]
     fn jog_speed_changes_keep_moving_without_cancellation_or_changing_job_override() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Feed(0x91));
@@ -1557,14 +1644,20 @@ mod tests {
         controller.send(Action::FinishJog);
         wait(&controller, |s| s.status.state == "Jog");
         let before = sim.commands().len();
-        controller.send(Action::JogSpeed { speed: 2400.0 });
+        controller.send(Action::JogSpeed {
+            speed: 2400.0,
+            boosted: false,
+        });
         wait(&controller, |_| {
             sim.commands()[before..]
                 .iter()
                 .any(|cmd| cmd.starts_with("$J=") && cmd.ends_with("F2400.0"))
         });
         let before = sim.commands().len();
-        controller.send(Action::JogSpeed { speed: 600.0 });
+        controller.send(Action::JogSpeed {
+            speed: 600.0,
+            boosted: false,
+        });
         wait(&controller, |_| {
             sim.commands()[before..]
                 .iter()
@@ -1580,8 +1673,190 @@ mod tests {
     }
 
     #[test]
-    fn hull_trace_is_closed_xy_only_torch_off_and_returns_to_start() {
+    fn jog_override_shift_changes_running_packets_and_restores_user_percentage_on_completion() {
         let sim = Simulator::start().unwrap();
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
+        wait(&controller, |s| s.jog_override_supported == Some(true));
+        for byte in [0x91, 0x91, 0x91, 0x93, 0x93, 0x93] {
+            controller.send(Action::Feed(byte));
+        }
+        wait(&controller, |s| {
+            (s.status.feed_override - 1.33).abs() < 0.001
+        });
+        controller.send(Action::JogInput {
+            directions: [0, 0],
+            presses: [1, 0],
+            speed: 600.0,
+            boosted: false,
+            step: 40.0,
+        });
+        wait(&controller, |s| {
+            s.status.state == "Jog" && s.status.feed == 600.0
+        });
+        controller.send(Action::JogSpeed {
+            speed: 600.0,
+            boosted: true,
+        });
+        let fast = wait(&controller, |s| s.status.feed == 2400.0);
+        assert_eq!(fast.status.feed_override, 1.0);
+        controller.send(Action::JogSpeed {
+            speed: 600.0,
+            boosted: false,
+        });
+        wait(&controller, |s| {
+            s.status.feed == 600.0 && s.status.feed_override == 0.25
+        });
+        let done = wait(&controller, |s| {
+            s.status.idle() && !s.jog_override_active && s.status.wpos.x > 39.99
+        });
+        assert!((done.status.feed_override - 1.33).abs() < 0.001);
+        assert!(!done.console.iter().any(|line| line.contains("cancel jog")));
+        let machine = sim.machine.lock().unwrap();
+        assert_eq!(machine.jog_cancel_count, 0);
+        assert!(
+            machine
+                .commands
+                .iter()
+                .filter(|cmd| cmd.starts_with("$J=") && cmd.as_str() != crate::jog_override::PROBE)
+                .all(|cmd| cmd.ends_with("F2400.0P1"))
+        );
+    }
+
+    #[test]
+    fn jog_override_restores_after_cancel_stop_disconnect_and_close() {
+        for operation in ["cancel", "stop", "disconnect", "close"] {
+            let sim = Simulator::start().unwrap();
+            let checkpoint = CheckpointFile::new();
+            let controller = checkpoint.start(&sim);
+            wait(&controller, |s| s.jog_override_supported == Some(true));
+            controller.send(Action::Feed(0x91));
+            controller.send(Action::Feed(0x93));
+            wait(&controller, |s| {
+                (s.status.feed_override - 1.11).abs() < 0.001
+            });
+            controller.send(Action::JogInput {
+                directions: [0, 0],
+                presses: [1, 0],
+                speed: 600.0,
+                boosted: false,
+                step: 100.0,
+            });
+            wait(&controller, |s| {
+                s.status.state == "Jog" && s.status.feed_override == 0.25
+            });
+            let path = checkpoint.0.with_file_name("jog-override.json");
+            assert_eq!(
+                crate::jog_override::JogRecovery::load(path.clone())
+                    .unwrap()
+                    .get(&sim.address),
+                Some(111)
+            );
+            match operation {
+                "close" => {
+                    drop(controller);
+                    let m = sim.machine.lock().unwrap();
+                    assert!((m.feed - 1.11).abs() < 0.001);
+                    assert!(m.jogs.is_empty());
+                    assert_eq!(
+                        crate::jog_override::JogRecovery::load(path)
+                            .unwrap()
+                            .get(&sim.address),
+                        None
+                    );
+                    continue;
+                }
+                "cancel" => controller.send(Action::CancelJog),
+                "stop" => controller.send(Action::Stop),
+                "disconnect" => {
+                    sim.disconnect();
+                    wait(&controller, |s| !s.connected);
+                }
+                _ => unreachable!(),
+            }
+            let before_reconnect = sim.commands().len();
+            let done = wait(&controller, |s| {
+                s.initialized && s.status.idle() && !s.jog_override_active
+            });
+            assert!(
+                (done.status.feed_override - 1.11).abs() < 0.001,
+                "{operation}"
+            );
+            assert_eq!(
+                crate::jog_override::JogRecovery::load(path)
+                    .unwrap()
+                    .get(&sim.address),
+                None
+            );
+            if operation == "disconnect" {
+                assert!(
+                    !sim.commands()[before_reconnect..]
+                        .iter()
+                        .any(|cmd| cmd.starts_with("$J=") && cmd != crate::jog_override::PROBE)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jog_override_busy_probe_retries_without_motion_or_changing_override() {
+        let sim = Simulator::start().unwrap();
+        sim.machine.lock().unwrap().jog_probe_error = Some(8);
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
+        wait(&controller, |_| {
+            sim.commands()
+                .iter()
+                .any(|cmd| cmd == crate::jog_override::PROBE)
+        });
+        assert_eq!(controller.snapshot().jog_override_supported, None);
+        sim.machine.lock().unwrap().jog_probe_error = None;
+        let ready = wait(&controller, |s| s.jog_override_supported == Some(true));
+        assert!(ready.error.is_none());
+        let m = sim.machine.lock().unwrap();
+        assert!(m.jogs.is_empty() && m.position == Point::default());
+        assert_eq!(m.feed, 1.0);
+    }
+
+    #[test]
+    fn jog_override_app_restart_cancels_abandoned_jog_and_recovers_user_percentage() {
+        let sim = Simulator::start().unwrap();
+        let checkpoint = CheckpointFile::new();
+        let recovery_path = checkpoint.0.with_file_name("jog-override.json");
+        let mut recovery = crate::jog_override::JogRecovery::load(recovery_path.clone()).unwrap();
+        recovery.begin(&sim.address, 133).unwrap();
+        sim.machine.lock().unwrap().feed = 0.25;
+        let mut link = crate::protocol::Link::connect(&sim.address).unwrap();
+        link.command("$J=G21G91X100F2400P1").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while sim.machine.lock().unwrap().jogs.is_empty() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let controller = checkpoint.start(&sim);
+        let ready = wait(&controller, |s| {
+            s.initialized && s.status.idle() && !s.jog_override_active
+        });
+        assert!((ready.status.feed_override - 1.33).abs() < 0.001);
+        assert_eq!(
+            crate::jog_override::JogRecovery::load(recovery_path)
+                .unwrap()
+                .get(&sim.address),
+            None
+        );
+        let m = sim.machine.lock().unwrap();
+        assert!(m.jogs.is_empty());
+        assert_eq!(
+            m.commands
+                .iter()
+                .filter(|cmd| cmd.as_str() == "$J=G21G91X100F2400P1")
+                .count(),
+            1
+        );
+        assert!(!m.commands.iter().any(|cmd| cmd.starts_with("G10")));
+    }
+
+    #[test]
+    fn hull_trace_is_closed_xy_only_torch_off_and_returns_to_start() {
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::SetCoordinate {
@@ -1624,7 +1899,11 @@ mod tests {
             assert!(!command.contains('Z') && !command.contains("M3"));
         }
         assert!(moves.iter().any(|c| c.contains("X10.00000Y10.00000")));
-        assert!(!commands.iter().any(|c| c.starts_with("$J=")));
+        assert!(
+            !commands
+                .iter()
+                .any(|c| c.starts_with("$J=") && c.as_str() != crate::jog_override::PROBE)
+        );
         assert!(!commands.iter().any(|c| c.starts_with("$LocalFS/Run=")));
         controller.send(Action::TraceHull {
             speed: 600.0,
@@ -1633,17 +1912,24 @@ mod tests {
         wait(&controller, |s| s.tracing && s.status.state == "Run");
         controller.send(Action::CancelTrace);
         wait(&controller, |s| !s.tracing && s.status.idle());
-        let count = sim.commands().len();
+        let count = sim
+            .commands()
+            .iter()
+            .filter(|c| c.starts_with("G21G90G94G1"))
+            .count();
         thread::sleep(Duration::from_millis(350));
         assert_eq!(
             count,
-            sim.commands().len(),
+            sim.commands()
+                .iter()
+                .filter(|c| c.starts_with("G21G90G94G1"))
+                .count(),
             "Trace must not resume after cancellation"
         );
     }
     #[test]
     fn trace_shift_updates_queued_g1_motion_and_restores_exact_user_override_on_cancel() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         for byte in [0x91, 0x91, 0x91, 0x93, 0x93, 0x93] {
@@ -1673,7 +1959,11 @@ mod tests {
         assert!(!slow.console.iter().any(|s| s.contains("cancel jog")
             || s.contains("soft reset")
             || s.contains("feed hold")));
-        assert!(!sim.commands().iter().any(|c| c.starts_with("$J=")));
+        assert!(
+            !sim.commands()
+                .iter()
+                .any(|c| c.starts_with("$J=") && c.as_str() != crate::jog_override::PROBE)
+        );
         controller.send(Action::CancelTrace);
         let restored = wait(&controller, |s| {
             !s.tracing && s.initialized && s.status.idle()
@@ -1687,7 +1977,7 @@ mod tests {
 
     #[test]
     fn trace_completion_restores_modal_units_distance_and_feed_override() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Console("G20G91G1F12".into()));
@@ -1718,7 +2008,7 @@ mod tests {
 
     #[test]
     fn closing_during_a_trace_stops_motion_and_restores_override() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Feed(0x91));
@@ -1744,7 +2034,7 @@ mod tests {
 
     #[test]
     fn app_restart_recovers_a_borrowed_override_and_never_replays_the_trace() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let scratch = CheckpointFile::new();
         let recovery_path = scratch.0.with_file_name("trace-restore.json");
         let mut recovery = crate::trace::TraceRecovery::load(recovery_path.clone()).unwrap();
@@ -1785,7 +2075,7 @@ mod tests {
     #[test]
     fn trace_rejection_and_alarm_restore_the_override_without_claiming_completion() {
         for alarm in [false, true] {
-            let sim = Simulator::start().unwrap();
+            let sim = Simulator::legacy().unwrap();
             let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
             wait(&controller, |s| s.initialized && s.status.position_known);
             controller.send(Action::Feed(0x91));
@@ -1822,7 +2112,7 @@ mod tests {
 
     #[test]
     fn console_is_separate_and_updates_dro_and_override_promptly() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         let started = Instant::now();
@@ -1859,7 +2149,7 @@ mod tests {
     }
     #[test]
     fn console_replies_and_errors_leave_job_completion_on_its_own_channel() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized);
         controller.send(Action::Load {
@@ -1891,7 +2181,7 @@ mod tests {
     }
     #[test]
     fn normal_stop_avoids_abort_alarm_and_unlock_clears_alarm_message() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Load {
@@ -1931,7 +2221,7 @@ mod tests {
     }
     #[test]
     fn hull_trace_rejects_lit_torch_and_never_restarts_after_reconnect() {
-        let sim = Simulator::start().unwrap();
+        let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
         wait(&controller, |s| s.initialized && s.status.position_known);
         controller.send(Action::Load {

@@ -2,6 +2,7 @@ use crate::{
     coordinates::Coordinates,
     gcode::{self, ParseOptions, Point, Program, TimeParts},
     jog::ManualJog,
+    jog_override::{self, JogOverride, JogRecovery},
     protocol::{self, Link, Status},
     trace::{RestorePhase, SavedTrace, Trace, TraceRecovery, TraceRestore},
 };
@@ -46,6 +47,7 @@ pub enum Action {
     },
     JogSpeed {
         speed: f64,
+        boosted: bool,
     },
     CancelTrace,
     Feed(u8),
@@ -60,12 +62,14 @@ pub enum Action {
         directions: [i8; 2],
         presses: [i32; 2],
         speed: f64,
+        boosted: bool,
         step: f64,
     },
     JogTo {
         x: f64,
         y: f64,
         speed: f64,
+        boosted: bool,
     },
     #[cfg(test)]
     FinishJog,
@@ -100,6 +104,9 @@ pub struct Snapshot {
     pub alarm: Option<String>,
     pub tracing: bool,
     pub jog_restarting: bool,
+    pub jog_override_supported: Option<bool>,
+    pub jog_detecting: bool,
+    pub jog_override_active: bool,
     pub job: bool,
     pub phase: String,
     pub elapsed: f64,
@@ -136,6 +143,9 @@ impl Default for Snapshot {
             alarm: None,
             tracing: false,
             jog_restarting: false,
+            jog_override_supported: None,
+            jog_detecting: false,
+            jog_override_active: false,
             job: false,
             phase: String::new(),
             elapsed: 0.0,
@@ -177,6 +187,8 @@ impl Snapshot {
             && !self.transferring
             && !self.tracing
             && !self.jog_restarting
+            && !self.jog_override_active
+            && !self.jog_detecting
     }
     pub fn can_jog(&self) -> bool {
         self.connected
@@ -318,6 +330,20 @@ impl Controller {
         let handle = thread::spawn(move || {
             let mut worker = Worker::new(address, http, rx, state);
             if let Some(path) = coordinates_path {
+                match JogRecovery::load(path.with_file_name("jog-override.json")) {
+                    Ok(recovery) => {
+                        worker.jog_override =
+                            recovery.get(&worker.address).map(JogOverride::interrupted);
+                        worker.s.jog_override_active = worker.jog_override.is_some();
+                        worker.jog_recovery = recovery;
+                    }
+                    Err(e) => {
+                        worker.fail(format!("Cannot read jog override recovery state: {e:#}"));
+                        // Keep the console usable, but do not start a job with
+                        // an unknown borrowed feed register.
+                        worker.s.jog_override_active = true;
+                    }
+                }
                 match TraceRecovery::load(path.with_file_name("trace-restore.json")) {
                     Ok(recovery) => {
                         if let Some(saved) = recovery.get(&worker.address) {
@@ -487,6 +513,9 @@ struct Worker {
     tracker: Tracker,
     last_tick: Instant,
     jog: Option<ManualJog>,
+    jog_override: Option<JogOverride>,
+    jog_recovery: JogRecovery,
+    jog_probe_after: Instant,
     jog_restart: Option<JogRestart>,
     inches: bool,
     got_units: bool,
@@ -541,6 +570,9 @@ impl Worker {
             },
             last_tick: now,
             jog: None,
+            jog_override: None,
+            jog_recovery: JogRecovery::default(),
+            jog_probe_after: now,
             jog_restart: None,
             inches: false,
             got_units: false,
@@ -610,6 +642,13 @@ impl Worker {
                 match Link::connect(&self.address) {
                     Ok(link) => {
                         self.link = Some(link);
+                        self.s.jog_override_supported = None;
+                        self.jog_probe_after = Instant::now();
+                        if self.jog_override.is_some() {
+                            // Discard abandoned opted-in jogs before restoring
+                            // the shared register. Jog cancel ignores jobs.
+                            let _ = self.realtime(&[protocol::JOG_CANCEL]);
+                        }
                         if self.cancel_trace_on_connect {
                             let _ = self.realtime(&[protocol::HOLD]);
                             self.stopping = Some(Instant::now());
@@ -627,7 +666,13 @@ impl Worker {
                         self.got_units = false;
                         self.init_started = false;
                         self.selected_work_system = false;
-                        self.coordinate_recovery = CoordinateRecovery::Pending;
+                        self.coordinate_recovery = if self.jog_override.is_some() {
+                            // An interrupted jog may have moved after its last
+                            // checkpoint. Its live work coordinates win.
+                            CoordinateRecovery::Ready
+                        } else {
+                            CoordinateRecovery::Pending
+                        };
                         self.queue.clear();
                         self.pending = None;
                         self.queue.push_back("$report_inches".into());
@@ -670,6 +715,15 @@ impl Worker {
             if let Err(e) = self.advance_jog() {
                 self.fail(format!("{e:#}"));
             }
+            if let Err(e) = self.advance_jog_override() {
+                self.fail(format!("{e:#}"));
+            }
+            self.advance_jog_probe();
+            self.s.jog_detecting = self
+                .pending
+                .as_ref()
+                .is_some_and(|(cmd, _)| *cmd == jog_override::PROBE)
+                || self.queue.iter().any(|cmd| *cmd == jog_override::PROBE);
             self.advance_transfer();
             self.checkpoint_coordinates();
             self.s.elapsed = self.tracker.elapsed;
@@ -684,7 +738,9 @@ impl Worker {
                 );
             }
             if shutdown.is_some_and(|at| {
-                self.trace_restore.is_none() && self.stopping.is_none()
+                self.trace_restore.is_none()
+                    && self.stopping.is_none()
+                    && self.jog_override.is_none()
                     || self.link.is_none()
                     || at.elapsed() > Duration::from_secs(8)
             }) {
@@ -703,6 +759,10 @@ impl Worker {
         self.s.error = Some(message);
     }
     fn disconnected(&mut self, message: String) {
+        if let Some(lease) = &mut self.jog_override {
+            lease.interrupt();
+            let _ = self.realtime(&[protocol::JOG_CANCEL]);
+        }
         if self.s.connected && self.s.job {
             self.lost_at = Some((Instant::now(), self.s.status.state == "Run"));
         }
@@ -1012,7 +1072,7 @@ impl Worker {
                 .pending
                 .as_ref()
                 .is_none_or(|(cmd, _)| cmd.starts_with("$LocalFS/Run=") || cmd.starts_with("$J="))
-            && self.queue.is_empty();
+            && self.queue.iter().all(|cmd| *cmd == jog_override::PROBE);
         if !can_checkpoint {
             return;
         }
@@ -1120,6 +1180,11 @@ impl Worker {
                 || self.init_started
                 || self.got_units)
         {
+            self.s.jog_override_supported = None;
+            self.jog_probe_after = Instant::now();
+            if let Some(lease) = &mut self.jog_override {
+                lease.interrupt();
+            }
             self.trace = None;
             if let Some(restore) = &mut self.trace_restore {
                 if matches!(restore.phase, RestorePhase::Tracing) {
@@ -1146,7 +1211,12 @@ impl Worker {
             self.s.planner_blocks = None;
             self.jog_ack_delay = 0.01;
             self.selected_work_system = false;
-            self.coordinate_recovery = CoordinateRecovery::Pending;
+            // A banner on an existing connection refreshes protocol state, not
+            // the work origin. Only an unfinished connection setup may still
+            // need its initial coordinate restoration.
+            if !matches!(self.coordinate_recovery, CoordinateRecovery::Ready) {
+                self.coordinate_recovery = CoordinateRecovery::Pending;
+            }
             self.s.status = Status::default();
             self.s.status.state = "Connecting".into();
             self.s.modal.clear();
@@ -1244,6 +1314,31 @@ impl Worker {
         if (line == "ok" || line.starts_with("error:"))
             && let Some((cmd, sent)) = self.pending.take()
         {
+            if cmd == jog_override::PROBE {
+                match line {
+                    "ok" => {
+                        self.s.jog_override_supported = Some(true);
+                        if let Some(jog) = &mut self.jog {
+                            let base = jog.speed / if jog.boosted { 4.0 } else { 1.0 };
+                            jog.use_override = true;
+                            jog.set_speed(base, jog.boosted);
+                        }
+                        self.s.log("Jog feed override supported");
+                    }
+                    "error:36" => {
+                        self.s.jog_override_supported = Some(false);
+                        self.s
+                            .log("Jog feed override unavailable; using ordinary jog feeds");
+                    }
+                    _ => {
+                        // Busy/alarm errors say nothing about P support.
+                        self.jog_probe_after = Instant::now() + Duration::from_secs(1);
+                    }
+                }
+                self.realtime(b"?")?;
+                self.poll = Instant::now();
+                return Ok(());
+            }
             if cmd.starts_with("$J=") && line == "ok" {
                 if self.jog_restart.is_none() {
                     self.jog_ack_delay =
@@ -1562,8 +1657,8 @@ impl Worker {
             }
             Action::Feed(byte) => {
                 ensure!(
-                    !self.s.tracing,
-                    "Hull tracing is temporarily using feed override"
+                    !self.s.tracing && !self.s.jog_override_active,
+                    "Jogging or hull tracing is temporarily using feed override"
                 );
                 ensure!(
                     [0x90, 0x91, 0x92, 0x93, 0x94].contains(&byte),
@@ -1591,24 +1686,35 @@ impl Worker {
                         0
                     }
                 });
-                self.jog_input(directions, presses, speed, step)?;
+                self.jog_input(directions, presses, speed, step, false)?;
             }
             Action::JogInput {
                 directions,
                 presses,
                 speed,
+                boosted,
                 step,
             } => {
-                self.jog_input(directions, presses, speed, step)?;
+                self.jog_input(directions, presses, speed, step, boosted)?;
             }
-            Action::JogTo { x, y, speed } => {
+            Action::JogTo {
+                x,
+                y,
+                speed,
+                boosted,
+            } => {
                 ensure!(
                     self.s.can_jog() && !self.s.status.torch && x.is_finite() && y.is_finite(),
                     "Jog to position requires an idle machine and finite coordinates"
                 );
-                ensure!(speed.is_finite() && speed > 0.0, "Invalid jog speed");
+                ensure!(
+                    speed.is_finite() && speed > 0.0 && (speed * 4.0).is_finite(),
+                    "Invalid jog speed"
+                );
                 let was_sent = self.jog.as_ref().is_some_and(|jog| jog.sent);
                 let mut jog = ManualJog::new(self.s.status.wpos, speed, Instant::now());
+                jog.use_override = self.s.jog_override_supported == Some(true);
+                jog.set_speed(speed, boosted);
                 jog.go_to(Point {
                     x,
                     y,
@@ -1623,7 +1729,8 @@ impl Worker {
             #[cfg(test)]
             Action::FinishJog => {
                 if let Some(jog) = &self.jog {
-                    self.jog_input([0, 0], [0, 0], jog.speed, 1.0)?;
+                    let base = jog.speed / if jog.boosted { 4.0 } else { 1.0 };
+                    self.jog_input([0, 0], [0, 0], base, 1.0, jog.boosted)?;
                 }
             }
             Action::CancelJog => {
@@ -1677,6 +1784,10 @@ impl Worker {
             }
             Action::Connect { address, http } => {
                 ensure!(
+                    !self.s.connected || !self.s.jog_override_active,
+                    "Wait for jogging and feed override restoration before changing controller"
+                );
+                ensure!(
                     !self.s.job && !self.s.tracing && self.transfer.is_none(),
                     "Cannot change controller during a job or upload"
                 );
@@ -1685,6 +1796,11 @@ impl Worker {
                     "Use a TCP host:port and an http:// URL"
                 );
                 if self.address != address {
+                    self.jog_override = self
+                        .jog_recovery
+                        .get(&address)
+                        .map(JogOverride::interrupted);
+                    self.s.jog_override_active = self.jog_override.is_some();
                     self.trace_restore = self
                         .trace_recovery
                         .get(&address)
@@ -1715,9 +1831,12 @@ impl Worker {
                     }
                 }
             }
-            Action::JogSpeed { speed } => {
-                ensure!(speed.is_finite() && speed > 0.0, "Invalid jog speed");
-                self.change_jog_speed(speed)?;
+            Action::JogSpeed { speed, boosted } => {
+                ensure!(
+                    speed.is_finite() && speed > 0.0 && (speed * 4.0).is_finite(),
+                    "Invalid jog speed"
+                );
+                self.change_jog_speed(speed, boosted);
             }
             Action::TraceSpeed { boosted } => {
                 let target = if boosted { 100 } else { 25 };
@@ -1733,6 +1852,7 @@ impl Worker {
             Action::TraceHull { speed, boosted } => {
                 ensure!(
                     self.s.can_jog()
+                        && !self.s.jog_override_active
                         && self.s.status.idle()
                         && self.s.status.position_known
                         && !self.s.status.torch
@@ -1864,10 +1984,146 @@ impl Worker {
         }
         Ok(())
     }
-    fn change_jog_speed(&mut self, speed: f64) -> Result<()> {
+    fn change_jog_speed(&mut self, speed: f64, boosted: bool) {
         if let Some(jog) = &mut self.jog {
-            jog.speed = speed;
+            jog.set_speed(speed, boosted);
         }
+    }
+    fn advance_jog_probe(&mut self) {
+        if self.s.jog_override_supported.is_none()
+            && Instant::now() >= self.jog_probe_after
+            && self.s.can_jog()
+            && self.s.status.idle()
+            && !self.s.status.torch
+            && self.jog.as_ref().is_none_or(|jog| !jog.sent)
+            && self.jog_override.is_none()
+            && self.stopping.is_none()
+            && self.reset_wait.is_none()
+            && self.pending.is_none()
+            && self.queue.is_empty()
+        {
+            self.queue.push_back(jog_override::PROBE.into());
+        }
+    }
+    fn prepare_jog_override(&mut self) -> Result<bool> {
+        let target = if self.jog.as_ref().unwrap().boosted {
+            100
+        } else {
+            25
+        };
+        if self.jog_override.is_none() {
+            if self.s.jog_override_active {
+                self.action(Action::CancelJog)?;
+                anyhow::bail!(
+                    "Jog override recovery state is unavailable; use the console to inspect the controller"
+                );
+            }
+            if self.s.status.override_at.is_none() {
+                if self.poll.elapsed() > Duration::from_millis(50) {
+                    self.realtime(b"?")?;
+                    self.poll = Instant::now();
+                }
+                return Ok(false);
+            }
+            let percent = (self.s.status.feed_override * 100.0).round();
+            ensure!(
+                self.s.status.override_at.is_some() && (10.0..=200.0).contains(&percent),
+                "Wait for the controller's feed override before jogging"
+            );
+            let saved = percent as u8;
+            self.jog_recovery.begin(&self.address, saved)?;
+            self.jog_override = Some(JogOverride::interrupted(saved));
+            self.s.jog_override_active = true;
+        }
+        let lease = self.jog_override.as_mut().unwrap();
+        if lease.restoring || lease.target != target {
+            lease.restoring = false;
+            lease.target = target;
+            lease.sent = None;
+            lease.warned = false;
+            lease.confirmed = false;
+        }
+        let matches_target = (self.s.status.feed_override * 100.0 - f64::from(target)).abs() < 0.5;
+        if lease.confirmed && !matches_target {
+            lease.confirmed = false;
+            lease.sent = None;
+        }
+        if lease.sent.is_none() {
+            // Starting with Shift while already at 100% needs no register
+            // change. Avoid waiting for a sparse, unchanged Ov report.
+            if matches_target && self.s.status.fresh() {
+                lease.sent = Some(Instant::now());
+                lease.confirmed = true;
+                return Ok(true);
+            }
+            let sent = self.set_feed_override(target)?;
+            self.jog_override.as_mut().unwrap().sent = Some(sent);
+            return Ok(false);
+        }
+        let sent = lease.sent.unwrap();
+        if (lease.confirmed || self.s.status.override_at.is_some_and(|at| at > sent))
+            && matches_target
+        {
+            lease.confirmed = true;
+            return Ok(true);
+        }
+        if sent.elapsed() > Duration::from_secs(3) {
+            self.action(Action::CancelJog)?;
+            anyhow::bail!("Jog feed override was not confirmed; jogging cancelled");
+        }
+        if self.poll.elapsed() > Duration::from_millis(50) {
+            self.realtime(b"?")?;
+            self.poll = Instant::now();
+        }
+        Ok(false)
+    }
+    fn advance_jog_override(&mut self) -> Result<()> {
+        if self.jog_override.is_none()
+            || self.jog.is_some()
+            || !self.s.connected
+            || !self.s.initialized
+            || !self.s.status.fresh()
+            || !(self.s.status.idle() || self.s.status.state == "Alarm")
+            || self.stopping.is_some()
+            || self.reset_wait.is_some()
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(|(cmd, _)| cmd.starts_with("$J="))
+            || self.queue.iter().any(|cmd| cmd.starts_with("$J="))
+        {
+            return Ok(());
+        }
+        let lease = self.jog_override.as_mut().unwrap();
+        if !lease.restoring {
+            lease.interrupt();
+        }
+        let target = lease.saved;
+        if let Some(sent) = lease.sent {
+            if self.s.status.override_at.is_some_and(|at| at > sent)
+                && (self.s.status.feed_override * 100.0 - f64::from(target)).abs() < 0.5
+            {
+                self.jog_recovery.finish(&self.address)?;
+                self.jog_override = None;
+                self.s.jog_override_active = false;
+                return Ok(());
+            }
+            if sent.elapsed() < Duration::from_secs(3) {
+                if self.poll.elapsed() > Duration::from_millis(50) {
+                    self.realtime(b"?")?;
+                    self.poll = Instant::now();
+                }
+                return Ok(());
+            }
+            if !lease.warned {
+                lease.warned = true;
+                self.fail(
+                    "Jog feed override restoration not confirmed; Run remains blocked".into(),
+                );
+            }
+        }
+        let sent = self.set_feed_override(target)?;
+        self.jog_override.as_mut().unwrap().sent = Some(sent);
         Ok(())
     }
     fn begin_jog_restart(&mut self) -> Result<()> {
@@ -1944,6 +2200,7 @@ impl Worker {
         presses: [i32; 2],
         speed: f64,
         step: f64,
+        boosted: bool,
     ) -> Result<()> {
         ensure!(
             self.s.can_jog() && !self.s.status.torch && self.stopping.is_none(),
@@ -1952,18 +2209,21 @@ impl Worker {
         ensure!(
             speed.is_finite()
                 && speed > 0.0
+                && (speed * 4.0).is_finite()
                 && step.is_finite()
                 && step > 0.0
                 && directions.iter().all(|d| (-1..=1).contains(d)),
             "Invalid jog input"
         );
         let now = Instant::now();
-        let jog = self
-            .jog
-            .get_or_insert_with(|| ManualJog::new(self.s.status.wpos, speed, now));
+        let jog = self.jog.get_or_insert_with(|| {
+            let mut jog = ManualJog::new(self.s.status.wpos, speed, now);
+            jog.use_override = self.s.jog_override_supported == Some(true);
+            jog
+        });
         jog.observe(self.s.status.wpos, now);
         let changed = jog.input(directions, presses, step, now);
-        jog.speed = speed;
+        jog.set_speed(speed, boosted);
         if changed && !jog.sent {
             // Nothing has entered the jog queue yet, so apply held-release
             // cancellation locally. Waiting for a realtime cancel/restart
@@ -1978,7 +2238,7 @@ impl Worker {
         Ok(())
     }
     fn advance_jog(&mut self) -> Result<()> {
-        let Some(jog) = &mut self.jog else {
+        let Some(jog) = &self.jog else {
             return Ok(());
         };
         if !jog.released() && jog.heartbeat.elapsed() > Duration::from_millis(250)
@@ -1988,6 +2248,13 @@ impl Worker {
             self.action(Action::CancelJog)?;
             return Ok(());
         }
+        if self.s.jog_override_supported.is_none() {
+            return Ok(());
+        }
+        if jog.use_override && !self.prepare_jog_override()? {
+            return Ok(());
+        }
+        let jog = self.jog.as_mut().unwrap();
         jog.observe(self.s.status.wpos, Instant::now());
         if self.jog_restart.is_some()
             || self.pending.is_some()
@@ -2006,10 +2273,12 @@ impl Worker {
                 z: 0.0,
             }
         };
-        if let Some(lookahead) =
-            self.s
-                .jog_lookahead(direction, jog.speed, jog.active_speed, self.jog_ack_delay)
-        {
+        if let Some(lookahead) = self.s.jog_lookahead(
+            direction,
+            jog.nominal_feed,
+            jog.active_speed,
+            self.jog_ack_delay,
+        ) {
             if jog.extended.elapsed() >= Duration::from_millis(100)
                 && jog.target.distance(self.s.status.wpos) <= lookahead.refill + 0.001
             {
@@ -2028,7 +2297,14 @@ impl Worker {
                     .cursor
                     .lerp(jog.target, (lookahead.segment / remaining).min(1.0));
                 self.queue.push_back(
-                    format!("$J=G21G90X{:.5}Y{:.5}F{:.1}", point.x, point.y, jog.speed).into(),
+                    format!(
+                        "$J=G21G90X{:.5}Y{:.5}F{:.1}{}",
+                        point.x,
+                        point.y,
+                        jog.nominal_feed,
+                        if jog.use_override { "P1" } else { "" }
+                    )
+                    .into(),
                 );
                 jog.cursor = point;
                 jog.sent = true;
@@ -2052,14 +2328,21 @@ impl Worker {
         Ok(())
     }
     fn reset_controller(&mut self) -> Result<()> {
-        if self.trace_restore.is_some()
-            && self.s.status.fresh()
+        if let Some(lease) = &mut self.jog_override {
+            lease.interrupt();
+        }
+        // Save the confirmed final stop for a future connection. This does not
+        // write controller offsets or request coordinate restoration on reset.
+        if self.s.status.fresh()
+            && self
+                .stopping
+                .is_none_or(|started| self.s.status.at.is_some_and(|at| at > started))
             && (self.s.status.held() || self.s.status.idle())
             && self.s.status.position_known
             && self.s.status.wco_known
             && let Err(e) = self.coordinates.record(&self.address, self.s.status.wpos)
         {
-            self.fail(format!("Cannot checkpoint stopped trace position: {e:#}"));
+            self.fail(format!("Cannot checkpoint stopped position: {e:#}"));
         }
         self.realtime(&[protocol::RESET])?;
         self.s.job = false;
@@ -2076,7 +2359,9 @@ impl Worker {
         self.s.initialized = false;
         self.init_started = false;
         self.selected_work_system = false;
-        self.coordinate_recovery = CoordinateRecovery::Pending;
+        // Stop keeps FluidNC's live coordinates. Reinitialize reporting and
+        // settings, but never reapply a checkpoint during this connection.
+        self.coordinate_recovery = CoordinateRecovery::Ready;
         self.got_units = false;
         self.auto_reports = false;
         self.reset_wait = Some(Instant::now());
@@ -2455,7 +2740,7 @@ mod tests {
     }
 
     fn connected_worker() -> (crate::simulator::Simulator, Worker) {
-        let sim = crate::simulator::Simulator::start().unwrap();
+        let sim = crate::simulator::Simulator::legacy().unwrap();
         let (_tx, rx) = mpsc::channel();
         let mut worker = Worker::new(
             sim.address.clone(),
@@ -2466,6 +2751,7 @@ mod tests {
         worker.link = Some(Link::connect(&sim.address).unwrap());
         worker.s.connected = true;
         worker.s.initialized = true;
+        worker.s.jog_override_supported = Some(false);
         worker.s.acceleration = [Some(100.0); 2];
         worker.s.planner_blocks = Some(16);
         worker.got_units = true;
@@ -2685,6 +2971,7 @@ mod tests {
                 presses: [2, 1],
                 speed: 600.0,
                 step: 0.25,
+                boosted: false,
             })
             .unwrap();
         assert_eq!(
@@ -2717,6 +3004,7 @@ mod tests {
                 presses: [1, 0],
                 speed: 600.0,
                 step: 100.0,
+                boosted: false,
             })
             .unwrap();
         worker.jog.as_mut().unwrap().axes[0].pressed =
@@ -2729,6 +3017,7 @@ mod tests {
                 presses: [0, 0],
                 speed: 600.0,
                 step: 100.0,
+                boosted: false,
             })
             .unwrap();
         assert!(!worker.jog.as_ref().unwrap().sent);
@@ -2754,6 +3043,7 @@ mod tests {
                 presses: [1, 0],
                 speed: 600.0,
                 step: 1.0,
+                boosted: false,
             })
             .unwrap();
         worker
@@ -2762,6 +3052,7 @@ mod tests {
                 presses: [0, 0],
                 speed: 600.0,
                 step: 1.0,
+                boosted: false,
             })
             .unwrap();
         worker.line("ok").unwrap();
@@ -2780,6 +3071,7 @@ mod tests {
                 presses: [1, 1],
                 speed: 600.0,
                 step: 100.0,
+                boosted: false,
             })
             .unwrap();
         for axis in &mut worker.jog.as_mut().unwrap().axes {
@@ -2791,6 +3083,7 @@ mod tests {
                 presses: [0, 0],
                 speed: 600.0,
                 step: 100.0,
+                boosted: false,
             })
             .unwrap();
         worker.line("ok").unwrap();
@@ -2808,6 +3101,7 @@ mod tests {
                 presses: [1, 1],
                 speed: 600.0,
                 step: 1.0,
+                boosted: false,
             })
             .unwrap();
         let ago = Instant::now() - Duration::from_secs(1);
@@ -2824,6 +3118,7 @@ mod tests {
                 presses: [0, 0],
                 speed: 600.0,
                 step: 1.0,
+                boosted: false,
             })
             .unwrap();
         assert!(worker.s.jog_restarting);
@@ -2846,6 +3141,7 @@ mod tests {
                 presses: [1, 0],
                 speed: 600.0,
                 step: 1.0,
+                boosted: false,
             })
             .unwrap();
         worker.advance_jog().unwrap();
@@ -2867,6 +3163,7 @@ mod tests {
                 presses: [-1, 0],
                 speed: 600.0,
                 step: 1.0,
+                boosted: false,
             })
             .unwrap();
         assert_eq!(worker.jog.as_ref().unwrap().target.x, 9.5);
@@ -2972,7 +3269,12 @@ mod tests {
         worker.advance_jog().unwrap();
         let cmd = worker.queue.pop_front().unwrap();
         worker.pending = Some((cmd, Instant::now()));
-        worker.action(Action::JogSpeed { speed: 2400.0 }).unwrap();
+        worker
+            .action(Action::JogSpeed {
+                speed: 2400.0,
+                boosted: false,
+            })
+            .unwrap();
         assert!(worker.jog_restart.is_none());
         assert!(
             !worker
@@ -2995,7 +3297,12 @@ mod tests {
         let command = worker.queue.pop_front().unwrap();
         assert!(command.ends_with("F2400.0"));
         assert_eq!(worker.jog.as_ref().unwrap().target.x, 110.0);
-        worker.action(Action::JogSpeed { speed: 600.0 }).unwrap();
+        worker
+            .action(Action::JogSpeed {
+                speed: 600.0,
+                boosted: false,
+            })
+            .unwrap();
         assert!(worker.jog_restart.is_none());
         assert!(
             !worker
@@ -3019,10 +3326,83 @@ mod tests {
     }
 
     #[test]
+    fn opted_in_jog_shift_bypasses_pending_ack_and_restoration_gates_run() {
+        let (_sim, mut worker) = connected_worker();
+        worker.s.jog_override_supported = Some(true);
+        worker
+            .line("<Idle|MPos:10,20,0|WCO:0,0,0|Ov:133,100,100>")
+            .unwrap();
+        worker.s.ready = true;
+        worker
+            .jog_input([0, 0], [1, 0], 600.0, 100.0, false)
+            .unwrap();
+        worker.advance_jog().unwrap();
+        assert!(worker.queue.is_empty());
+        assert_eq!(worker.jog_override.as_ref().unwrap().saved, 133);
+        assert!(!worker.s.can_run());
+        worker.line("<Idle|MPos:10,20,0|Ov:25,100,100>").unwrap();
+        worker.advance_jog().unwrap();
+        let cmd = worker.queue.pop_front().unwrap();
+        assert!(cmd.ends_with("F2400.0P1"));
+        worker.pending = Some((cmd, Instant::now()));
+        let cursor = worker.jog.as_ref().unwrap().cursor;
+        worker
+            .action(Action::JogSpeed {
+                speed: 600.0,
+                boosted: true,
+            })
+            .unwrap();
+        worker.advance_jog().unwrap();
+        assert_eq!(worker.jog_override.as_ref().unwrap().target, 100);
+        assert_eq!(worker.jog.as_ref().unwrap().cursor, cursor);
+        assert!(worker.pending.is_some() && worker.queue.is_empty());
+        assert!(
+            !worker
+                .s
+                .console
+                .iter()
+                .any(|line| line.contains("cancel jog"))
+        );
+        worker.pending = None;
+        worker.jog = None;
+        worker.line("<Idle|MPos:11,20,0|Ov:100,100,100>").unwrap();
+        worker.advance_jog_override().unwrap();
+        assert!(worker.s.jog_override_active && !worker.s.can_run());
+        worker.line("<Idle|MPos:11,20,0|Ov:133,100,100>").unwrap();
+        worker.advance_jog_override().unwrap();
+        assert!(!worker.s.jog_override_active && worker.s.can_run());
+    }
+
+    #[test]
+    fn jog_probe_only_accepts_ok_and_treats_unused_words_as_legacy() {
+        let (_sim, mut worker) = connected_worker();
+        worker.s.jog_override_supported = None;
+        worker.pending = Some((jog_override::PROBE.into(), Instant::now()));
+        worker.line("error:8").unwrap();
+        assert_eq!(worker.s.jog_override_supported, None);
+        assert!(worker.s.error.is_none());
+        worker.advance_jog_probe();
+        assert!(worker.queue.is_empty());
+        worker.jog_probe_after = Instant::now();
+        worker.advance_jog_probe();
+        assert_eq!(worker.queue.pop_front().unwrap(), jog_override::PROBE);
+        worker.pending = Some((jog_override::PROBE.into(), Instant::now()));
+        worker.line("error:36").unwrap();
+        assert_eq!(worker.s.jog_override_supported, Some(false));
+        assert!(worker.s.error.is_none());
+        worker.jog_input([0, 0], [1, 0], 600.0, 1.0, false).unwrap();
+        worker.advance_jog().unwrap();
+        assert!(worker.queue.pop_front().unwrap().ends_with("F600.0"));
+        assert!(worker.jog_override.is_none());
+    }
+
+    #[test]
     fn jog_input_speed_changes_allow_high_feeds_without_cancelling() {
         let (_sim, mut worker) = connected_worker();
         for (speed, presses) in [(6000.0, [1, 0]), (24000.0, [0, 0]), (6000.0, [0, 0])] {
-            worker.jog_input([1, 0], presses, speed, 200.0).unwrap();
+            worker
+                .jog_input([1, 0], presses, speed, 200.0, false)
+                .unwrap();
             worker.advance_jog().unwrap();
             worker.queue.clear();
             assert_eq!(worker.jog.as_ref().unwrap().speed, speed);
@@ -3036,7 +3416,14 @@ mod tests {
                 .any(|line| line.contains("cancel jog"))
         );
         for speed in [0.0, -1.0, f64::INFINITY, f64::NAN] {
-            assert!(worker.action(Action::JogSpeed { speed }).is_err());
+            assert!(
+                worker
+                    .action(Action::JogSpeed {
+                        speed,
+                        boosted: false
+                    })
+                    .is_err()
+            );
         }
     }
 
@@ -3250,8 +3637,96 @@ mod tests {
         assert_eq!(tracker.coefficient(), 1.0);
     }
     #[test]
+    fn normal_job_stop_saves_final_held_coordinates_before_reset() {
+        let (_sim, mut worker) = connected_worker();
+        let previous = worker.s.status.wpos;
+        worker
+            .coordinates
+            .record(&worker.address, previous)
+            .unwrap();
+        worker.s.job = true;
+        worker
+            .line("<Run|MPos:15,13,2|WCO:5,-7,2|FS:600,1|A:S>")
+            .unwrap();
+        worker.pending = Some(("$LocalFS/Run=plasma.nc".into(), Instant::now()));
+        worker.action(Action::Stop).unwrap();
+        worker
+            .line("<Hold:0|MPos:19,16,3|FS:0,0|Ov:100,100,100>")
+            .unwrap();
+        let stopped = worker.s.status.wpos;
+        assert!(stopped.distance(previous) > 1.0);
+        assert_eq!(worker.coordinates.get(&worker.address), Some(previous));
+        worker.advance_stop().unwrap();
+        assert_eq!(
+            worker.coordinates.get(&worker.address),
+            Some(stopped),
+            "Reset must not restore an earlier moving position and shift the work origin"
+        );
+        assert!(worker.reset_wait.is_some());
+    }
+
+    #[test]
+    fn forced_stop_does_not_checkpoint_a_report_from_before_the_hold_request() {
+        let (_sim, mut worker) = connected_worker();
+        let previous = worker.s.status.wpos;
+        worker
+            .coordinates
+            .record(&worker.address, previous)
+            .unwrap();
+        worker.s.job = true;
+        worker
+            .line("<Hold:0|MPos:14,23,1|WCO:0,0,0|FS:0,0>")
+            .unwrap();
+        worker.action(Action::Stop).unwrap();
+        worker.action(Action::Stop).unwrap();
+        assert_eq!(worker.coordinates.get(&worker.address), Some(previous));
+        assert!(worker.reset_wait.is_some());
+    }
+
+    #[test]
+    fn stop_reset_keeps_live_coordinates_even_when_checkpoint_disagrees() {
+        let (_sim, mut worker) = connected_worker();
+        let previous = worker.s.status.wpos;
+        worker
+            .coordinates
+            .record(&worker.address, previous)
+            .unwrap();
+        worker.s.job = true;
+        worker
+            .line("<Run|MPos:14,23,1|WCO:0,0,0|FS:600,0>")
+            .unwrap();
+        worker.action(Action::Stop).unwrap();
+        worker.action(Action::Stop).unwrap(); // Forced reset before a stopped report.
+        worker.line("Grbl 4.1 [FluidNC reset]").unwrap();
+        // Complete report/units/work-system initialization on the same connection.
+        worker.queue.clear();
+        worker.got_units = true;
+        worker.selected_work_system = true;
+        worker
+            .line("<Idle|MPos:14,23,1|WCO:0,0,0|FS:0,0|Ov:100,100,100>")
+            .unwrap();
+        assert!(
+            worker.recover_coordinates().unwrap(),
+            "Stop must not re-enter coordinate restoration"
+        );
+        assert!(
+            worker.queue.is_empty(),
+            "Stop must not enqueue G10 to rewrite live offsets"
+        );
+        assert_eq!(
+            worker.s.status.wpos,
+            Point {
+                x: 14.0,
+                y: 23.0,
+                z: 1.0
+            }
+        );
+        assert_eq!(worker.coordinates.get(&worker.address), Some(previous));
+    }
+
+    #[test]
     fn stop_requires_a_report_newer_than_its_hold_request() {
-        let sim = crate::simulator::Simulator::start().unwrap();
+        let sim = crate::simulator::Simulator::legacy().unwrap();
         let (_tx, rx) = mpsc::channel();
         let mut worker = Worker::new(
             sim.address.clone(),
