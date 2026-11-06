@@ -78,6 +78,10 @@ pub enum Action {
         axis: char,
         value: f64,
     },
+    SetWorkPosition {
+        x: f64,
+        y: f64,
+    },
     Connect {
         address: String,
         http: String,
@@ -1443,6 +1447,33 @@ impl Worker {
         self.s.log("Job completed");
         self.queue.push_back("$G".into());
     }
+    fn set_work_coordinates(&mut self, words: String) -> Result<()> {
+        ensure!(
+            self.s.connected
+                && self.s.initialized
+                && self.s.status.fresh()
+                && self.s.status.idle()
+                && !self.s.job
+                && !self.s.tracing
+                && self.jog.is_none(),
+            "Coordinates can only be changed while idle"
+        );
+        ensure!(!self.s.jog_restarting, "Wait for the jog restart to finish");
+        ensure!(
+            !self.s.transferring,
+            "Wait for upload verification before changing coordinates"
+        );
+        // Assign work coordinates at the current physical position, in mm.
+        // Both XY words go into one G10 when selecting a point in the preview.
+        self.queue.push_back("G21G54".into());
+        self.queue.push_back(format!("G10L20P1{words}").into());
+        self.queue.push_back("$Report/Interval=100".into());
+        self.queue.push_back("$G".into());
+        self.s.status.wco_known = false;
+        self.s.status.position_known = false;
+        self.preview_dirty = true;
+        Ok(())
+    }
     fn action(&mut self, action: Action) -> Result<()> {
         match action {
             action @ (Action::ListFiles
@@ -1753,34 +1784,14 @@ impl Worker {
             }
             Action::SetCoordinate { axis, value } => {
                 ensure!(
-                    self.s.connected
-                        && self.s.initialized
-                        && self.s.status.fresh()
-                        && self.s.status.idle()
-                        && !self.s.job
-                        && !self.s.tracing
-                        && self.jog.is_none(),
-                    "Coordinates can only be changed while idle"
-                );
-                ensure!(!self.s.jog_restarting, "Wait for the jog restart to finish");
-                ensure!(
-                    !self.s.transferring,
-                    "Wait for upload verification before changing coordinates"
-                );
-                ensure!(
                     matches!(axis, 'X' | 'Y') && value.is_finite(),
                     "Invalid coordinate"
                 );
-                // G10 L20 sets the work offset at the current physical position. Explicit
-                // G21 avoids interpreting a displayed millimetre value as inches.
-                self.queue.push_back("G21G54".into());
-                self.queue
-                    .push_back(format!("G10L20P1{axis}{value:.6}").into());
-                self.queue.push_back("$Report/Interval=100".into());
-                self.queue.push_back("$G".into());
-                self.s.status.wco_known = false;
-                self.s.status.position_known = false;
-                self.preview_dirty = true;
+                self.set_work_coordinates(format!("{axis}{value:.6}"))?;
+            }
+            Action::SetWorkPosition { x, y } => {
+                ensure!(x.is_finite() && y.is_finite(), "Invalid work coordinates");
+                self.set_work_coordinates(format!("X{x:.6}Y{y:.6}"))?;
             }
             Action::Connect { address, http } => {
                 ensure!(

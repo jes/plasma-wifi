@@ -138,10 +138,38 @@ try:
     wait(lambda s: s["state"] == "Idle" and len([c for c in s["commands"] if c.startswith("$J=")]) > count
          and abs(s["x"] - before_click["x"]) + abs(s["y"] - before_click["y"]) > 1,
          "Ctrl-click did not jog to the preview position")
+    preview_point = state()
     time.sleep(0.2)
     click(30, 130)
     click(30, 176)
     wait(lambda s: abs(s["x"]) < 0.001 and abs(s["y"]) < 0.001, "Could not zero work coordinates after preview jog")
+
+    # Menu selection must use the original right-click, not the menu pointer.
+    time.sleep(0.3)
+    before_menu = state()
+    command("mousemove", "--window", window, 750, 350, "click", 3)
+    time.sleep(0.3)
+    screenshot("toolpath-menu.png")
+    click(850, 421)  # Set work coordinates to here.
+    assigned = wait(lambda s: abs(s["x"] - preview_point["x"]) < 0.002
+                    and abs(s["y"] - preview_point["y"]) < 0.002,
+                    "Right-click work-coordinate assignment did not use the selected point")
+    assert assigned["mpos_x"] == before_menu["mpos_x"] and assigned["mpos_y"] == before_menu["mpos_y"], "Setting preview coordinates moved the machine"
+    time.sleep(0.2)
+    click(30, 130)
+    click(30, 176)
+    wait(lambda s: abs(s["x"]) < 0.001 and abs(s["y"]) < 0.001, "Could not zero coordinates after menu assignment")
+    time.sleep(0.2)
+    command("mousemove", "--window", window, 750, 350, "click", 3)
+    time.sleep(0.2)
+    click(815, 389)  # Jog to here.
+    wait(lambda s: s["state"] == "Idle" and abs(s["x"] - preview_point["x"]) < 0.002
+         and abs(s["y"] - preview_point["y"]) < 0.002,
+         "Right-click jog did not reach the selected point", timeout=10)
+    time.sleep(0.2)
+    click(30, 130)
+    click(30, 176)
+    wait(lambda s: abs(s["x"]) < 0.001 and abs(s["y"]) < 0.001, "Could not zero coordinates after menu jog")
 
     # Editing the DRO changes the work offset, never physical position.
     before = state()
@@ -279,16 +307,19 @@ try:
     assert any(c.startswith("$J=") and c.endswith("F2400.0P1") for c in rapid["commands"][len(before["commands"]):]), "Shift did not multiply keyboard jog feed"
 
     # Shift also changes speed during a held mouse jog, without pointer movement.
+    time.sleep(0.3)  # let the preceding tap leave the controller's jog state
     baseline = len(state()["commands"])
-    cancellations = state()["jog_cancel_count"]
     command("mousemove", "--window", window, 225, 751, "mousedown", 1)
     wait(lambda s: s["state"] == "Jog" and abs(s["feed_override"] - 0.25) < 0.001 and any(c.startswith("$J=") and c.endswith("F2400.0P1") for c in s["commands"][baseline:]), "Held mouse jog did not start")
+    cancellations = state()["jog_cancel_count"]
+    time.sleep(1.0)  # exceed the GUI library's short-click timeout
+    assert state()["state"] == "Jog" and state()["jog_cancel_count"] == cancellations, "Long mouse hold lost the jog button"
     baseline = len(state()["commands"])
     command("keydown", "Shift_L")
-    wait(lambda s: s["state"] == "Jog" and abs(s["feed_override"] - 1.0) < 0.001 and s["velocity"] > 600, "Shift did not boost held mouse jog")
+    wait(lambda s: s["state"] == "Jog" and abs(s["feed_override"] - 1.0) < 0.001 and s["velocity"] > 601, "Shift did not boost held mouse jog")
     baseline = len(state()["commands"])
     command("keyup", "Shift_L")
-    wait(lambda s: s["state"] == "Jog" and abs(s["feed_override"] - 0.25) < 0.001 and s["velocity"] <= 600, "Releasing Shift did not slow held mouse jog")
+    wait(lambda s: s["state"] == "Jog" and abs(s["feed_override"] - 0.25) < 0.001 and s["velocity"] <= 601, "Releasing Shift did not slow held mouse jog")
     assert state()["jog_cancel_count"] == cancellations, "Shift speed change cancelled jogging"
     command("mouseup", 1)
     wait(lambda s: s["state"] == "Idle" and abs(s["feed_override"] - 1.0) < 0.001, "Mouse release did not stop jogging and restore feed override")
@@ -419,6 +450,11 @@ try:
         time.sleep(0.2)
         command("key", "Return")
         wait(lambda s: "G0X10Y0" in s["file"] and "G1X10Y10F600" in s["file"], "Native picker did not load and upload file")
+        command("windowfocus", window)
+        time.sleep(0.4)
+        source.write_text("G21G90\nG0X10Y0\nM3S1\nG1X10Y10F777\nX5Y5\nX0Y10\nM5\nM30\n")
+        click(150, 54)  # Reload G-code alongside the current file name.
+        wait(lambda s: "G1X10Y10F777" in s["file"], "Reload did not read the changed G-code from disk")
     command("windowfocus", window)
     time.sleep(0.6)
     click(292, 545)  # Borrow and restore a nondefault cutting override.
@@ -520,7 +556,32 @@ try:
     scrolled = Image.open(screenshot("small-scrolled.png"))
     assert scrolled.crop((0, 80, 344, 460)).tobytes() == fixed_before, "Scrolling hid or moved the DRO / Run / Pause / Stop"
     assert process.poll() is None
-    print("GUI smoke checks passed: native picker/cancel/upload, config upload/download/save/cancel, icon, G/M console/Escape/history/input focus, R/P/S run/pause/resume/stop, O/Ctrl+O open, syntax colors/line numbers, X/Y and /2, F/I numeric edits, jog tap/hold/release latency/autorepeat/Shift boost/focus, Run/Pause/Resume/Stop, Ctrl-click navigation, G1 hull/realtime Shift/return/cancel/override restoration, resize")
+    # A manual scan is the only operation allowed to invoke nmcli. Use a fake
+    # executable so this check never scans or changes the host's real network.
+    process.terminate()
+    process.wait(timeout=3)
+    with tempfile.TemporaryDirectory(prefix="plasma-wifi-rescan-") as folder:
+        folder = Path(folder)
+        calls = folder / "calls"
+        fake = folder / "nmcli"
+        fake.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "' + str(calls) + '"\nsleep 0.2\n')
+        fake.chmod(0o755)
+        scan_env = dict(env, PATH=str(folder) + os.pathsep + env.get("PATH", ""),
+                        XDG_CONFIG_HOME=str(folder / "config"), XDG_STATE_HOME=str(folder / "state"))
+        process = subprocess.Popen([str(BINARY), "--controller", "127.0.0.1:1", "--http", "http://127.0.0.1:1"], stderr=subprocess.PIPE, text=True, env=scan_env)
+        window = command("search", "--sync", "--name", "^Plasma WiFi$").splitlines()[0]
+        command("windowfocus", window)
+        time.sleep(0.8)
+        assert not calls.exists(), "Disconnected app automatically invoked nmcli"
+        screenshot("disconnected-rescan.png")
+        click(365, 23)
+        end = time.monotonic() + 3
+        while not calls.exists() and time.monotonic() < end:
+            time.sleep(0.04)
+        assert calls.exists(), "nmcli rescan button did not request a scan"
+        time.sleep(0.6)
+        assert calls.read_text().splitlines() == ["--wait 5 device wifi rescan"], "Rescan must invoke nmcli exactly once per click"
+    print("GUI smoke checks passed: manual Wi-Fi rescan, G-code reload from disk, right-click jog/work coordinates, native picker/cancel/upload, config upload/download/save/cancel, icon, G/M console/Escape/history/input focus, R/P/S run/pause/resume/stop, O/Ctrl+O open, syntax colors/line numbers, X/Y and /2, F/I numeric edits, jog tap/hold/release latency/autorepeat/Shift boost/focus, Run/Pause/Resume/Stop, Ctrl-click navigation, G1 hull/realtime Shift/return/cancel/override restoration, resize")
     print("Screenshots:", ROOT / "dist")
 finally:
     if process.poll() is None:

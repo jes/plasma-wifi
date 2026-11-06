@@ -1433,6 +1433,22 @@ mod tests {
             (s.status.wpos.x - 25.0).abs() < 0.001 && s.status.position_known
         });
         assert!((before.status.mpos.x - after.status.mpos.x).abs() < 0.001);
+        controller.send(Action::SetWorkPosition {
+            x: 42.125,
+            y: -7.25,
+        });
+        let assigned = wait(&controller, |s| {
+            s.status.position_known
+                && (s.status.wpos.x - 42.125).abs() < 0.001
+                && (s.status.wpos.y + 7.25).abs() < 0.001
+        });
+        assert!(assigned.status.mpos.distance(after.status.mpos) < 0.001);
+        assert_eq!(assigned.status.wpos.z, after.status.wpos.z);
+        assert!(
+            sim.commands()
+                .iter()
+                .any(|cmd| cmd == "G10L20P1X42.125000Y-7.250000")
+        );
     }
     #[test]
     fn reconnect_while_paused_retains_torch_restore_intent() {

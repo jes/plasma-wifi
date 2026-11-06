@@ -6,9 +6,10 @@ use egui::{Color32, Pos2, RichText, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
+    process::Command,
     sync::{
         Arc,
-        mpsc::{Receiver, TryRecvError},
+        mpsc::{self, Receiver, TryRecvError},
     },
 };
 
@@ -403,6 +404,11 @@ pub struct App {
     pub controller: Controller,
     settings: Settings,
     snapshot: Snapshot,
+    source_path: Option<PathBuf>,
+    wifi_rescan: Option<Receiver<anyhow::Result<()>>>,
+    wifi_notice: String,
+    preview_menu_point: Option<Point>,
+    preview_menu_open: bool,
     dro: [String; 2],
     dro_edit: [bool; 2],
     focus_control: Option<char>,
@@ -451,6 +457,11 @@ impl App {
         Self {
             controller,
             snapshot: Snapshot::default(),
+            source_path: None,
+            wifi_rescan: None,
+            wifi_notice: String::new(),
+            preview_menu_point: None,
+            preview_menu_open: false,
             settings,
             dro: ["0.000".into(), "0.000".into()],
             dro_edit: [false; 2],
@@ -489,6 +500,7 @@ impl App {
     pub fn open(&mut self, path: PathBuf) {
         match std::fs::read_to_string(&path) {
             Ok(text) => {
+                self.source_path = Some(path.clone());
                 if let Some(parent) = path.parent() {
                     self.settings.last_dir = parent.to_owned();
                     if !self.demo {
@@ -516,8 +528,69 @@ impl App {
             text: text.into(),
         });
     }
+    fn rescan_wifi(&mut self) {
+        if self.wifi_rescan.is_some() {
+            return;
+        }
+        if self.demo {
+            self.wifi_notice = "Wi-Fi rescan requested (simulated)".into();
+            return;
+        }
+        self.wifi_notice = "Requesting Wi-Fi rescan…".into();
+        let (tx, rx) = mpsc::channel();
+        self.wifi_rescan = Some(rx);
+        std::thread::spawn(move || {
+            let result = Command::new("nmcli")
+                .args(["--wait", "5", "device", "wifi", "rescan"])
+                .output()
+                .map_err(anyhow::Error::from)
+                .and_then(|output| {
+                    if output.status.success() {
+                        return Ok(());
+                    }
+                    let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                    anyhow::bail!(
+                        "{}",
+                        if message.is_empty() {
+                            output.status.to_string()
+                        } else {
+                            message
+                        }
+                    );
+                });
+            let _ = tx.send(result);
+        });
+    }
+    fn can_reload(&self) -> bool {
+        self.source_path.is_some()
+            && self.picker.is_none()
+            && !self.snapshot.job
+            && !self.snapshot.tracing
+            && !self.snapshot.transferring
+            && !self.snapshot.jog_restarting
+            && (!self.snapshot.connected
+                || !self.snapshot.initialized
+                || self.snapshot.status.idle())
+    }
     pub fn ui(&mut self, root: &mut egui::Ui) {
         self.snapshot = self.controller.snapshot();
+        if let Some(scan) = &self.wifi_rescan {
+            match scan.try_recv() {
+                Ok(Ok(())) => {
+                    self.wifi_notice = "Wi-Fi rescan requested".into();
+                    self.wifi_rescan = None;
+                }
+                Ok(Err(error)) => {
+                    self.wifi_notice = format!("Wi-Fi rescan failed: {error:#}");
+                    self.wifi_rescan = None;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.wifi_notice = "Wi-Fi rescan helper stopped unexpectedly".into();
+                    self.wifi_rescan = None;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         if let Some(program) = &self.snapshot.program
             && !self
                 .hull_program
@@ -654,6 +727,17 @@ impl App {
                     badge,
                     egui::Shape::rect_filled(state.rect.expand2(Vec2::new(3.0, 1.0)), 3.0, color),
                 );
+                if !self.snapshot.connected
+                    && ui
+                        .add_enabled(
+                            self.wifi_rescan.is_none(),
+                            egui::Button::new("nmcli rescan"),
+                        )
+                        .on_hover_text("Request one Wi-Fi scan using NetworkManager")
+                        .clicked()
+                {
+                    self.rescan_wifi();
+                }
                 if self.demo {
                     ui.label(RichText::new("SIMULATED CONTROLLER").color(ORANGE));
                 }
@@ -698,6 +782,25 @@ impl App {
                 } else {
                     &self.snapshot.name
                 });
+                if ui
+                    .add_enabled(
+                        self.can_reload(),
+                        egui::Button::new("Reload G-code").small(),
+                    )
+                    .on_hover_text(self.source_path.as_ref().map_or_else(
+                        || "Open a G-code file from disk to reload it".into(),
+                        |path| {
+                            format!(
+                                "Read {} again and upload the updated G-code",
+                                path.display()
+                            )
+                        },
+                    ))
+                    .clicked()
+                    && let Some(path) = self.source_path.clone()
+                {
+                    self.open(path);
+                }
                 ui.label(
                     RichText::new(&self.snapshot.upload).color(if self.snapshot.ready {
                         GREEN
@@ -705,6 +808,9 @@ impl App {
                         ORANGE
                     }),
                 );
+                if !self.snapshot.connected && !self.wifi_notice.is_empty() {
+                    ui.label(&self.wifi_notice);
+                }
             });
             ui.add_space(5.0);
         });
@@ -1138,7 +1244,9 @@ impl App {
                                     }
                                     let response = ui.add_sized(
                                         Vec2::splat(JOG_BUTTON_SIZE),
-                                        egui::Button::new(RichText::new(label).strong()).fill(BLUE),
+                                        egui::Button::new(RichText::new(label).strong())
+                                            .sense(egui::Sense::click_and_drag())
+                                            .fill(BLUE),
                                     );
                                     if response.is_pointer_button_down_on()
                                         && response.contains_pointer()
@@ -1227,6 +1335,7 @@ impl App {
             || self.console_open
             || self.log_open
             || self.files_open
+            || self.preview_menu_open
             || ctx.input(|i| i.key_down(egui::Key::Escape) || i.key_pressed(egui::Key::Escape))
             || !self.snapshot.can_jog()
             || self.snapshot.status.torch;
@@ -1316,6 +1425,7 @@ impl App {
         self.jog_interrupted = interrupted;
     }
     fn preview(&mut self, ui: &mut egui::Ui, height: f32) {
+        self.preview_menu_open = false;
         ui.horizontal(|ui| {
             ui.label(RichText::new("TOOLPATH").strong());
             if ui.button("Fit").clicked() {
@@ -1331,7 +1441,7 @@ impl App {
         );
         let rect = response.rect;
         painter.rect_filled(rect, 0.0, Color32::BLACK);
-        if response.dragged() {
+        if response.dragged_by(egui::PointerButton::Primary) {
             self.pan += response.drag_delta();
         }
         if response.hovered() {
@@ -1369,10 +1479,16 @@ impl App {
             y: (min.y + max.y) / 2.0,
             z: 0.0,
         };
+        let pan = self.pan;
+        let unproject = |pointer: Pos2| Point {
+            x: center.x + ((pointer.x - rect.center().x - pan.x) / scale) as f64,
+            y: center.y - ((pointer.y - rect.center().y - pan.y) / scale) as f64,
+            z: self.snapshot.status.wpos.z,
+        };
         let project = |p: Point| {
             Pos2::new(
-                rect.center().x + (p.x - center.x) as f32 * scale + self.pan.x,
-                rect.center().y - (p.y - center.y) as f32 * scale + self.pan.y,
+                rect.center().x + (p.x - center.x) as f32 * scale + pan.x,
+                rect.center().y - (p.y - center.y) as f32 * scale + pan.y,
             )
         };
         if response.clicked()
@@ -1382,14 +1498,59 @@ impl App {
             && !ui.ctx().egui_wants_keyboard_input()
             && let Some(pointer) = response.interact_pointer_pos()
         {
+            let point = unproject(pointer);
             self.controller.send(Action::JogTo {
-                x: center.x + ((pointer.x - rect.center().x - self.pan.x) / scale) as f64,
-                y: center.y - ((pointer.y - rect.center().y - self.pan.y) / scale) as f64,
+                x: point.x,
+                y: point.y,
                 speed: self.settings.jog_speed,
                 boosted: ui.input(|i| i.modifiers.shift),
             });
         }
-        response.on_hover_text("Ctrl-click: jog to this work position · drag: pan · wheel: zoom");
+        if response.secondary_clicked()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            self.preview_menu_point = Some(unproject(pointer));
+        }
+        response.context_menu(|ui| {
+            if let Some(point) = self.preview_menu_point {
+                ui.label(format!("X {:.3} · Y {:.3} mm", point.x, point.y));
+                if ui
+                    .add_enabled(
+                        self.snapshot.can_jog() && !self.snapshot.status.torch,
+                        egui::Button::new("Jog to here"),
+                    )
+                    .clicked()
+                {
+                    self.controller.send(Action::JogTo {
+                        x: point.x,
+                        y: point.y,
+                        speed: self.settings.jog_speed,
+                        boosted: ui.input(|i| i.modifiers.shift),
+                    });
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        self.can_set_coordinates(),
+                        egui::Button::new("Set work coordinates to here"),
+                    )
+                    .on_hover_text(
+                        "Assign these X/Y coordinates to the current tool position without moving",
+                    )
+                    .clicked()
+                {
+                    self.controller.send(Action::SetWorkPosition {
+                        x: point.x,
+                        y: point.y,
+                    });
+                    ui.close();
+                }
+            }
+        });
+        self.preview_menu_open = response.context_menu_opened();
+        response.on_hover_text(
+            "Right-click: jog or set work coordinates · Ctrl-click: jog · drag: pan · wheel: zoom",
+        );
         let painter = painter.with_clip_rect(rect);
         let spacing = 10f64.powf((60.0 / scale as f64).log10().floor()).max(0.001);
         if ((max.x - min.x) / spacing + (max.y - min.y) / spacing) < 300.0 {
