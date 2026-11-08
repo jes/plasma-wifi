@@ -2274,39 +2274,23 @@ impl Worker {
         {
             return Ok(());
         }
-        let held = jog.held_direction(Instant::now());
-        let direction = if held.x != 0.0 || held.y != 0.0 {
-            held
-        } else {
-            Point {
-                x: jog.target.x - jog.cursor.x,
-                y: jog.target.y - jog.cursor.y,
-                z: 0.0,
-            }
-        };
+        let now = Instant::now();
+        let direction = jog.motion_direction(now);
         if let Some(lookahead) = self.s.jog_lookahead(
             direction,
             jog.nominal_feed,
             jog.active_speed,
             self.jog_ack_delay,
         ) {
-            if jog.extended.elapsed() >= Duration::from_millis(100)
-                && jog.target.distance(self.s.status.wpos) <= lookahead.refill + 0.001
-            {
-                jog.extend(
-                    self.s.status.wpos,
-                    lookahead.refill + lookahead.segment,
-                    Instant::now(),
-                );
-            }
-            let remaining = jog.cursor.distance(jog.target);
-            if remaining > 1e-9 {
+            jog.extend(
+                self.s.status.wpos,
+                lookahead.refill + lookahead.segment,
+                now,
+            );
+            if let Some(point) = jog.next_point(lookahead.segment, now) {
                 if jog.sent && jog.cursor.distance(self.s.status.wpos) > lookahead.refill + 0.001 {
                     return Ok(());
                 }
-                let point = jog
-                    .cursor
-                    .lerp(jog.target, (lookahead.segment / remaining).min(1.0));
                 self.queue.push_back(
                     format!(
                         "$J=G21G90X{:.5}Y{:.5}F{:.1}{}",
@@ -2804,7 +2788,7 @@ mod tests {
         let mut planner: VecDeque<f64> = VecDeque::new();
         let mut reports: VecDeque<(f64, f64, f64, bool)> = VecDeque::new();
         let (mut position, mut velocity) = (0.0_f64, 0.0_f64);
-        let (mut next_report, mut last_report, mut extension_at) = (0.0, 0.0, 0.0);
+        let (mut next_report, mut last_report) = (0.0, 0.0);
         let duration = 50.0 / acceleration + 5.0;
         let dt = 0.002;
         let mut sustained = 50.0_f64;
@@ -2866,17 +2850,12 @@ mod tests {
                 last_report = now;
             }
             worker.s.status.at = Some(Instant::now() - Duration::from_secs_f64(now - last_report));
-            let before = worker.jog.as_ref().map(|jog| jog.target);
             if let Some(jog) = &mut worker.jog {
                 jog.heartbeat = Instant::now();
-                jog.extended = Instant::now() - Duration::from_secs_f64(now - extension_at);
             }
             worker.jog.as_mut().unwrap().axes[0].pressed =
                 Some(Instant::now() - Duration::from_secs(1));
             worker.advance_jog().unwrap();
-            if before != worker.jog.as_ref().map(|jog| jog.target) {
-                extension_at = now;
-            }
             if in_flight.is_none()
                 && let Some(command) = worker.queue.pop_front()
             {
@@ -3119,7 +3098,6 @@ mod tests {
         for axis in &mut worker.jog.as_mut().unwrap().axes {
             axis.pressed = Some(ago);
         }
-        worker.jog.as_mut().unwrap().extended = ago;
         worker.advance_jog().unwrap();
         worker.queue.clear();
         worker.line("<Jog|MPos:11.5,21.5,0>").unwrap();

@@ -116,6 +116,10 @@ impl Axis {
         }
         if self.direction == 0 {
             self.target = if self.met { current } else { self.incremental };
+        } else if self.held(now) {
+            // Queued held travel was discarded by the cancel. Rebuild it
+            // from the stopped cursor in the new coordinated direction.
+            self.target = current;
         } else if (self.target - current) * f64::from(self.direction) < 0.0 {
             self.target = current;
         }
@@ -132,7 +136,6 @@ pub struct ManualJog {
     pub cursor: Point,
     pub target: Point,
     pub heartbeat: Instant,
-    pub extended: Instant,
     pub sent: bool,
     pub sent_at: Option<Instant>,
 }
@@ -148,7 +151,6 @@ impl ManualJog {
             cursor: position,
             target: position,
             heartbeat: now,
-            extended: now,
             sent: false,
             sent_at: None,
         }
@@ -180,7 +182,8 @@ impl ManualJog {
         step: f64,
         now: Instant,
     ) -> bool {
-        let mut cancel = false;
+        let mut cancel =
+            directions != self.directions() && self.axes.iter().any(|axis| axis.held(now));
         for i in 0..2 {
             // Sample whether the incremental destination has been reached
             // before changing held flags or accumulating another press.
@@ -226,27 +229,79 @@ impl ManualJog {
         }
     }
     pub fn extend(&mut self, current: Point, distance: f64, now: Instant) {
-        let direction = self.held_direction(now);
+        let held = self.held_direction(now);
+        let direction = self.motion_direction(now);
         let length = direction.x.hypot(direction.y);
-        if length < 1e-9 {
+        if held.x == 0.0 && held.y == 0.0 || length < 1e-9 {
             return;
         }
+        let distance = (distance - self.cursor.distance(current)).max(0.0);
         for (axis, position, component) in self
             .axes
             .iter_mut()
-            .zip([current.x, current.y])
+            .zip([self.cursor.x, self.cursor.y])
             .zip([direction.x, direction.y])
             .map(|((a, p), c)| (a, p, c))
         {
-            if component != 0.0 {
-                let target = position + distance * component / length;
-                if (target - axis.target) * component > 0.0 {
-                    axis.target = target;
+            if axis.held(now) {
+                axis.target = position + distance * component / length;
+            }
+        }
+        self.sync_target();
+    }
+    pub fn motion_direction(&self, now: Instant) -> Point {
+        let held = self.held_direction(now);
+        let mut direction = Point {
+            x: self.target.x - self.cursor.x,
+            y: self.target.y - self.cursor.y,
+            z: 0.0,
+        };
+        if held.x != 0.0 || held.y != 0.0 {
+            // A fresh increment joining a hold travels at the same axis rate,
+            // even before that key's own hold delay expires. Its finite
+            // destination still limits travel until it becomes a hold.
+            direction.x = if held.x != 0.0 {
+                held.x
+            } else if direction.x.abs() > 1e-9 {
+                direction.x.signum()
+            } else {
+                0.0
+            };
+            direction.y = if held.y != 0.0 {
+                held.y
+            } else if direction.y.abs() > 1e-9 {
+                direction.y.signum()
+            } else {
+                0.0
+            };
+        }
+        direction
+    }
+    pub fn next_point(&self, distance: f64, now: Instant) -> Option<Point> {
+        let direction = self.motion_direction(now);
+        let length = direction.x.hypot(direction.y);
+        if length < 1e-9 {
+            return None;
+        }
+        let held = self.held_direction(now);
+        let mut fraction = distance / length;
+        if held.x == 0.0 && held.y == 0.0 {
+            fraction = fraction.min(1.0);
+        } else {
+            for (axis, component, cursor) in [
+                (&self.axes[0], direction.x, self.cursor.x),
+                (&self.axes[1], direction.y, self.cursor.y),
+            ] {
+                if !axis.held(now) && component != 0.0 {
+                    fraction = fraction.min((axis.target - cursor) / component);
                 }
             }
         }
-        self.extended = now;
-        self.sync_target();
+        Some(Point {
+            x: self.cursor.x + direction.x * fraction,
+            y: self.cursor.y + direction.y * fraction,
+            z: self.cursor.z,
+        })
     }
     fn sync_target(&mut self) {
         self.target = Point {
@@ -273,6 +328,58 @@ mod tests {
         assert_eq!(jog.target, p(11.0, 21.0));
     }
     #[test]
+    fn a_new_axis_joins_held_travel_diagonally_and_stays_straight_with_stale_feedback() {
+        for (x, y) in [(1, 1), (1, -1), (-1, 1), (-1, -1)] {
+            let now = Instant::now();
+            let later = now + HOLD_DELAY;
+            let mut jog = ManualJog::new(p(0.0, 0.0), 600.0, now);
+            jog.input([x, 0], [i32::from(x), 0], 100.0, now);
+            jog.sent = true;
+            jog.cursor = p(5.0 * f64::from(x), 0.0);
+            jog.extend(p(2.0 * f64::from(x), 0.0), 10.0, later);
+            assert!(jog.input([x, y], [0, i32::from(y)], 1.0, later));
+            let stopped = p(3.0 * f64::from(x), 0.0);
+            jog.rebase(stopped, later);
+
+            // The new key has not yet become a hold. Its increment already
+            // joins the old axis at equal rates, and cannot be overshot.
+            let first = jog.next_point(10.0, later).unwrap();
+            assert_eq!(first, p(stopped.x + f64::from(x), f64::from(y)));
+            jog.cursor = first;
+            assert_eq!(jog.axes[1].incremental, f64::from(y));
+
+            let both_held = later + HOLD_DELAY;
+            for _ in 0..8 {
+                // Deliberately keep using the same delayed position report.
+                jog.extend(stopped, 10.0, both_held);
+                let next = jog.next_point(0.5, both_held).unwrap();
+                let dx = (next.x - jog.cursor.x) * f64::from(x);
+                let dy = (next.y - jog.cursor.y) * f64::from(y);
+                assert!(dx > 0.0 && (dx - dy).abs() < 1e-9);
+                jog.cursor = next;
+            }
+        }
+    }
+
+    #[test]
+    fn a_quick_tap_joining_a_hold_keeps_its_finite_destination_after_release() {
+        let now = Instant::now();
+        let later = now + HOLD_DELAY;
+        let mut jog = ManualJog::new(p(0.0, 0.0), 600.0, now);
+        jog.input([1, 0], [1, 0], 100.0, now);
+        jog.sent = true;
+        jog.input([1, 1], [0, 1], 1.0, later);
+        jog.rebase(p(2.0, 0.0), later);
+        assert!(jog.input([1, 0], [0, 0], 1.0, later + Duration::from_millis(40)));
+        jog.rebase(p(2.2, 0.2), later + Duration::from_millis(50));
+        assert_eq!(jog.target.y, 1.0);
+        let next = jog
+            .next_point(10.0, later + Duration::from_millis(50))
+            .unwrap();
+        assert!((next.x - 3.0).abs() < 1e-9);
+        assert_eq!(next.y, 1.0);
+    }
+    #[test]
     fn held_release_discards_the_released_axis_and_keeps_other_held_axes() {
         let now = Instant::now();
         let later = now + HOLD_DELAY;
@@ -283,6 +390,7 @@ mod tests {
         assert!(jog.input([0, 1], [0, 0], 1.0, later));
         jog.rebase(p(2.4, 0.8), later);
         assert_eq!(jog.target.x, 2.4);
+        jog.extend(p(2.4, 0.8), 5.0, later);
         assert!(jog.target.y > 1.0);
         jog.input([0, 0], [0, 0], 1.0, later);
         jog.rebase(p(2.4, 0.9), later);
@@ -343,6 +451,7 @@ mod tests {
         jog.input([1, 0], [1, 0], 1.0, now);
         let later = now + HOLD_DELAY;
         jog.observe(p(3.0, 0.0), later);
+        jog.cursor = p(3.0, 0.0);
         jog.extend(p(3.0, 0.0), 5.0, later);
         jog.input([1, 0], [1, 0], 1.0, later);
         assert!(jog.target.x >= 8.0);

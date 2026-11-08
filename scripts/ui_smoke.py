@@ -255,6 +255,28 @@ try:
     wait(lambda s: s["state"] == "Idle", "Jog did not cancel on key release")
     assert state()["mpos_x"] > before["mpos_x"], "Arrow key did not jog"
 
+    # A second arrow joining a held axis should promptly produce straight
+    # diagonal travel, including after a large initial increment on that axis.
+    edit_shortcut("i", "100")
+    click(450, 400)
+    command("keydown", "Right")
+    time.sleep(0.5)
+    joined = state()
+    command("keydown", "Up")
+    diagonal = wait(lambda s: s["y"] > joined["y"] + 0.5,
+                    "Second arrow did not promptly join held travel", timeout=0.8)
+    time.sleep(0.4)
+    moved = state()
+    dx, dy = moved["x"] - diagonal["x"], moved["y"] - diagonal["y"]
+    assert dx > 0 and dy > 0 and abs(dx - dy) < 0.05, "Held diagonal travel lurched between axes"
+    command("keyup", "Right")
+    time.sleep(0.3)
+    only_y = state()
+    time.sleep(0.25)
+    assert abs(state()["x"] - only_y["x"]) < 0.001 and state()["y"] > only_y["y"], "Releasing one diagonal axis did not leave the other jogging"
+    command("keyup", "Up")
+    wait(lambda s: s["state"] == "Idle", "Diagonal jog did not stop on release")
+
     # Holding past OS autorepeat must not create extra taps. Even with a
     # large initial increment, key release must cancel immediately and stop
     # within communication latency plus the simulator's braking distance.
@@ -452,6 +474,16 @@ try:
         wait(lambda s: "G0X10Y0" in s["file"] and "G1X10Y10F600" in s["file"], "Native picker did not load and upload file")
         command("windowfocus", window)
         time.sleep(0.4)
+        chooser()
+        command("key", "ctrl+l", "ctrl+a")
+        # Resolve a basename in the chooser's starting folder, rather than
+        # supplying an absolute path that would hide a forgotten directory.
+        subprocess.run(["xclip", "-selection", "clipboard"], input=source.name, text=True, check=True, stderr=subprocess.DEVNULL)
+        command("key", "ctrl+v", "Return")
+        wait(lambda s: subprocess.run(["xdotool", "search", "--onlyvisible", "--name", "^Open G-code$"], capture_output=True).returncode != 0,
+             "Zenity forgot the G-code directory")
+        time.sleep(0.4)
+        command("windowfocus", window)
         source.write_text("G21G90\nG0X10Y0\nM3S1\nG1X10Y10F777\nX5Y5\nX0Y10\nM5\nM30\n")
         click(150, 54)  # Reload G-code alongside the current file name.
         wait(lambda s: "G1X10Y10F777" in s["file"], "Reload did not read the changed G-code from disk")

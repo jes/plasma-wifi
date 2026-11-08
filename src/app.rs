@@ -356,6 +356,7 @@ pub struct Settings {
     pub jog_increment: f64,
     pub text_size: f32,
     pub last_dir: PathBuf,
+    pub last_transfer_dir: Option<PathBuf>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -368,6 +369,7 @@ impl Default for Settings {
             last_dir: std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(".")),
+            last_transfer_dir: None,
         }
     }
 }
@@ -498,6 +500,9 @@ impl App {
         }
     }
     pub fn open(&mut self, path: PathBuf) {
+        // Command-line files may be relative. The desktop chooser needs an
+        // absolute directory, and Reload should keep referring to this file.
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 self.source_path = Some(path.clone());
@@ -613,7 +618,7 @@ impl App {
                             crate::file_dialog::Purpose::Gcode => self.open(path),
                             purpose => {
                                 if let Some(parent) = path.parent() {
-                                    self.settings.last_dir = parent.to_owned();
+                                    self.settings.last_transfer_dir = Some(parent.to_owned());
                                     if !self.demo {
                                         self.settings.save();
                                     }
@@ -1857,7 +1862,10 @@ impl App {
                     {
                         self.picker_purpose = crate::file_dialog::Purpose::Upload;
                         self.picker = Some(crate::file_dialog::choose(
-                            self.settings.last_dir.clone(),
+                            self.settings
+                                .last_transfer_dir
+                                .clone()
+                                .unwrap_or_else(|| self.settings.last_dir.clone()),
                             self.native_window,
                             self.picker_purpose.clone(),
                         ));
@@ -1907,7 +1915,10 @@ impl App {
                                     self.remote_filename.clone(),
                                 );
                                 self.picker = Some(crate::file_dialog::choose(
-                                    self.settings.last_dir.clone(),
+                                    self.settings
+                                        .last_transfer_dir
+                                        .clone()
+                                        .unwrap_or_else(|| self.settings.last_dir.clone()),
                                     self.native_window,
                                     self.picker_purpose.clone(),
                                 ));

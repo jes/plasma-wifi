@@ -32,6 +32,16 @@ pub fn open(folder: PathBuf, window: u32) -> Receiver<Result<Option<PathBuf>>> {
 }
 
 pub fn choose(folder: PathBuf, window: u32, purpose: Purpose) -> Receiver<Result<Option<PathBuf>>> {
+    // Helpers such as zenity need an absolute filename. Resolve old relative
+    // settings too, and recover if the remembered directory was removed.
+    let folder = std::fs::canonicalize(&folder)
+        .ok()
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/"))
+        });
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let result = futures_lite::future::block_on(portal(&folder, window, &purpose));
@@ -106,6 +116,7 @@ fn helper(folder: &Path, window: u32, purpose: &Purpose) -> Result<Option<PathBu
     };
     for tool in tools {
         let mut command = Command::new(tool);
+        command.current_dir(folder);
         let path = if let Purpose::Download(name) = purpose {
             folder.join(name)
         } else {
@@ -116,7 +127,8 @@ fn helper(folder: &Path, window: u32, purpose: &Purpose) -> Result<Option<PathBu
                 .args(["--file-selection", "--modal"])
                 .arg(format!("--title={}", purpose.title()))
                 .arg(format!("--attach={window}"))
-                .arg(format!("--filename={}", path.display()));
+                .arg("--filename")
+                .arg(&path);
             if matches!(purpose, Purpose::Download(_)) {
                 command.args(["--save", "--confirm-overwrite"]);
             }
