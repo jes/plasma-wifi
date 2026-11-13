@@ -330,6 +330,9 @@ try:
 
     # Shift also changes speed during a held mouse jog, without pointer movement.
     time.sleep(0.3)  # let the preceding tap leave the controller's jog state
+    for _ in range(5):
+        click(40, 545)  # Select 50% before borrowing the shared jog register.
+    wait(lambda s: abs(s["feed_override"] - 0.5) < 0.001, "Could not select 50% before jogging")
     baseline = len(state()["commands"])
     command("mousemove", "--window", window, 225, 751, "mousedown", 1)
     wait(lambda s: s["state"] == "Jog" and abs(s["feed_override"] - 0.25) < 0.001 and any(c.startswith("$J=") and c.endswith("F2400.0P1") for c in s["commands"][baseline:]), "Held mouse jog did not start")
@@ -344,7 +347,10 @@ try:
     wait(lambda s: s["state"] == "Jog" and abs(s["feed_override"] - 0.25) < 0.001 and s["velocity"] <= 601, "Releasing Shift did not slow held mouse jog")
     assert state()["jog_cancel_count"] == cancellations, "Shift speed change cancelled jogging"
     command("mouseup", 1)
-    wait(lambda s: s["state"] == "Idle" and abs(s["feed_override"] - 1.0) < 0.001, "Mouse release did not stop jogging and restore feed override")
+    wait(lambda s: s["state"] == "Idle" and abs(s["feed_override"] - 0.5) < 0.001, "Mouse release did not restore the selected 50% feed override")
+    time.sleep(0.3)
+    click(165, 545)  # Explicitly restore 100% for the following motion checks.
+    wait(lambda s: abs(s["feed_override"] - 1.0) < 0.001, "Explicit 100% feed selection failed")
     time.sleep(0.3)  # Receive Idle and enable Run in the UI before clicking.
 
     click(55, 298)  # Run
@@ -516,6 +522,18 @@ try:
     click(135, 924)  # Cancel hull trace
     wait(lambda s: s["state"]=="Idle" and abs(s["feed_override"]-start["feed_override"])<0.001,
          "Hull cancellation did not stop motion and restore feed override")
+    time.sleep(0.3)
+    click(165, 545)
+    for _ in range(5):
+        click(40, 545)
+    wait(lambda s: abs(s["feed_override"] - 0.5) < 0.001, "Could not select 50% before repeated jobs")
+    for attempt in range(2):
+        time.sleep(0.4)  # Allow the confirmed override to enable Run in the UI.
+        click(55, 298)
+        running = wait(lambda s: s["state"] == "Run" and s["torch"], f"Repeated job {attempt + 1} did not start")
+        assert abs(running["feed_override"] - 0.5) < 0.001, "Repeated job started with the wrong feed override"
+        wait(lambda s: s["state"] == "Idle" and abs(s["feed_override"] - 0.5) < 0.001,
+             f"Job {attempt + 1} did not restore 50% after M30", timeout=10)
     time.sleep(0.3)
     count=sum(c.startswith(("G21G90G94G1", "$J=")) for c in state()["commands"])
     time.sleep(0.4)

@@ -111,6 +111,7 @@ pub struct Snapshot {
     pub jog_override_supported: Option<bool>,
     pub jog_detecting: bool,
     pub jog_override_active: bool,
+    pub feed_override_pending: bool,
     pub job: bool,
     pub phase: String,
     pub elapsed: f64,
@@ -150,6 +151,7 @@ impl Default for Snapshot {
             jog_override_supported: None,
             jog_detecting: false,
             jog_override_active: false,
+            feed_override_pending: false,
             job: false,
             phase: String::new(),
             elapsed: 0.0,
@@ -182,6 +184,7 @@ impl Snapshot {
         self.connected
             && self.initialized
             && self.status.fresh()
+            && self.status.override_at.is_some()
             && self.status.idle()
             && self.status.position_known
             && self.status.wco_known
@@ -192,6 +195,7 @@ impl Snapshot {
             && !self.tracing
             && !self.jog_restarting
             && !self.jog_override_active
+            && !self.feed_override_pending
             && !self.jog_detecting
     }
     pub fn can_jog(&self) -> bool {
@@ -520,6 +524,10 @@ struct Worker {
     jog_override: Option<JogOverride>,
     jog_recovery: JogRecovery,
     jog_probe_after: Instant,
+    // User intent is independent of the shared register borrowed by jogging
+    // and tracing, and of FluidNC's M2/M30 and soft-reset defaults.
+    user_feed: Option<u8>,
+    feed_restore_sent: Option<Instant>,
     jog_restart: Option<JogRestart>,
     inches: bool,
     got_units: bool,
@@ -577,6 +585,8 @@ impl Worker {
             jog_override: None,
             jog_recovery: JogRecovery::default(),
             jog_probe_after: now,
+            user_feed: None,
+            feed_restore_sent: None,
             jog_restart: None,
             inches: false,
             got_units: false,
@@ -722,6 +732,9 @@ impl Worker {
             if let Err(e) = self.advance_jog_override() {
                 self.fail(format!("{e:#}"));
             }
+            if let Err(e) = self.advance_feed_override() {
+                self.fail(format!("{e:#}"));
+            }
             self.advance_jog_probe();
             self.s.jog_detecting = self
                 .pending
@@ -801,6 +814,8 @@ impl Worker {
         self.stopping = None;
         self.auto_reports = false;
         self.s.status.at = None;
+        self.s.feed_override_pending = self.user_feed.is_some();
+        self.feed_restore_sent = None;
         self.reset_wait = None;
         if self.s.job {
             self.s.timing_uncertain = true;
@@ -1098,6 +1113,25 @@ impl Worker {
             }
             let previous_state = self.s.status.state.clone();
             self.s.status.update(line, self.inches);
+            if line.contains("|Ov:") {
+                let feed = self.user_feed.get_or_insert_with(|| {
+                    self.jog_override
+                        .as_ref()
+                        .map(|lease| lease.saved)
+                        .or_else(|| {
+                            self.trace_restore
+                                .as_ref()
+                                .map(|restore| restore.saved.feed)
+                        })
+                        .unwrap_or((self.s.status.feed_override * 100.0).round() as u8)
+                });
+                if self.jog_override.is_none()
+                    && self.trace_restore.is_none()
+                    && (self.s.status.feed_override * 100.0 - f64::from(*feed)).abs() >= 0.5
+                {
+                    self.s.feed_override_pending = true;
+                }
+            }
             if !self.s.status.state.contains("Alarm") {
                 self.s.alarm = None;
             }
@@ -1185,6 +1219,8 @@ impl Worker {
                 || self.got_units)
         {
             self.s.jog_override_supported = None;
+            self.s.feed_override_pending = self.user_feed.is_some();
+            self.feed_restore_sent = None;
             self.jog_probe_after = Instant::now();
             if let Some(lease) = &mut self.jog_override {
                 lease.interrupt();
@@ -1438,6 +1474,11 @@ impl Worker {
     }
     fn finish(&mut self) {
         self.s.job = false;
+        // M2/M30 can acknowledge the file before the reset Ov report arrives.
+        // Require a new override report before allowing another Run.
+        self.s.status.override_at = None;
+        self.s.feed_override_pending = self.user_feed.is_some();
+        self.feed_restore_sent = None;
         self.pause = PauseState::None;
         self.s.phase = "Completed".into();
         self.s.progress = 1.0;
@@ -1696,6 +1737,20 @@ impl Worker {
                     "Invalid override"
                 );
                 self.realtime(&[byte])?;
+                let current = i16::from(
+                    self.user_feed
+                        .unwrap_or((self.s.status.feed_override * 100.0).round() as u8),
+                );
+                self.user_feed = Some(match byte {
+                    0x90 => 100,
+                    0x91 => (current + 10).min(200) as u8,
+                    0x92 => (current - 10).max(10) as u8,
+                    0x93 => (current + 1).min(200) as u8,
+                    0x94 => (current - 1).max(10) as u8,
+                    _ => unreachable!(),
+                });
+                self.s.feed_override_pending = true;
+                self.feed_restore_sent = Some(Instant::now());
                 self.realtime(b"?")?;
                 self.poll = Instant::now();
             }
@@ -1807,6 +1862,9 @@ impl Worker {
                     "Use a TCP host:port and an http:// URL"
                 );
                 if self.address != address {
+                    self.user_feed = None;
+                    self.feed_restore_sent = None;
+                    self.s.feed_override_pending = false;
                     self.jog_override = self
                         .jog_recovery
                         .get(&address)
@@ -1864,6 +1922,7 @@ impl Worker {
                 ensure!(
                     self.s.can_jog()
                         && !self.s.jog_override_active
+                        && !self.s.feed_override_pending
                         && self.s.status.idle()
                         && self.s.status.position_known
                         && !self.s.status.torch
@@ -2041,7 +2100,8 @@ impl Worker {
                 self.s.status.override_at.is_some() && (10.0..=200.0).contains(&percent),
                 "Wait for the controller's feed override before jogging"
             );
-            let saved = percent as u8;
+            let saved = self.user_feed.unwrap_or(percent as u8);
+            self.user_feed = Some(saved);
             self.jog_recovery.begin(&self.address, saved)?;
             self.jog_override = Some(JogOverride::interrupted(saved));
             self.s.jog_override_active = true;
@@ -2340,6 +2400,8 @@ impl Worker {
             self.fail(format!("Cannot checkpoint stopped position: {e:#}"));
         }
         self.realtime(&[protocol::RESET])?;
+        self.s.feed_override_pending = self.user_feed.is_some();
+        self.feed_restore_sent = None;
         self.s.job = false;
         self.s.tracing = self.trace_restore.is_some();
         self.trace = None;
@@ -2418,6 +2480,57 @@ impl Worker {
         self.realtime(&bytes)?;
         self.poll = Instant::now();
         Ok(Instant::now())
+    }
+    fn advance_feed_override(&mut self) -> Result<()> {
+        let Some(target) = self.user_feed else {
+            return Ok(());
+        };
+        if self.jog_override.is_some()
+            || self.trace_restore.is_some()
+            || !self.s.connected
+            || !self.s.status.fresh()
+        {
+            return Ok(());
+        }
+        let confirmed = self
+            .s
+            .status
+            .override_at
+            .is_some_and(|at| self.feed_restore_sent.is_none_or(|sent| at > sent));
+        if confirmed && (self.s.status.feed_override * 100.0 - f64::from(target)).abs() < 0.5 {
+            self.s.feed_override_pending = false;
+            self.feed_restore_sent = None;
+            return Ok(());
+        }
+        self.s.feed_override_pending = true;
+        if self
+            .feed_restore_sent
+            .is_some_and(|sent| sent.elapsed() < Duration::from_secs(3))
+            || self.s.status.override_at.is_none()
+        {
+            if self.poll.elapsed() > Duration::from_millis(50) {
+                self.realtime(b"?")?;
+                self.poll = Instant::now();
+            }
+            return Ok(());
+        }
+        // Never change the register under active motion or during cleanup.
+        if !self.s.initialized
+            || self.s.job
+            || !(self.s.status.idle() || self.s.status.state == "Alarm")
+            || self.stopping.is_some()
+            || self.reset_wait.is_some()
+            || self.pending.is_some()
+            || !self.queue.is_empty()
+        {
+            return Ok(());
+        }
+        let timed_out = self.feed_restore_sent.is_some();
+        self.feed_restore_sent = Some(self.set_feed_override(target)?);
+        if timed_out {
+            anyhow::bail!("User feed override restoration not confirmed; Run remains blocked");
+        }
+        Ok(())
     }
     fn queue_trace(&mut self, text: String) {
         self.queue.push_back(QueuedCommand { text, trace: true });
@@ -3312,6 +3425,54 @@ mod tests {
         worker.advance_jog_restart().unwrap();
         worker.advance_jog().unwrap();
         assert!(worker.jog.is_none() && worker.queue.is_empty());
+    }
+
+    #[test]
+    fn jog_saves_user_selection_even_before_feed_button_reports_arrive() {
+        let (_sim, mut worker) = connected_worker();
+        worker.s.jog_override_supported = Some(true);
+        for _ in 0..5 {
+            worker.action(Action::Feed(0x92)).unwrap();
+        }
+        assert_eq!(worker.s.status.feed_override, 1.0);
+        worker.jog_input([0, 0], [1, 0], 600.0, 1.0, false).unwrap();
+        worker.advance_jog().unwrap();
+        assert_eq!(worker.jog_override.as_ref().unwrap().saved, 50);
+        worker.line("<Idle|MPos:10,20,0|Ov:25,100,100>").unwrap();
+        worker.jog = None;
+        worker.advance_jog_override().unwrap();
+        worker.line("<Idle|MPos:10,20,0|Ov:50,100,100>").unwrap();
+        worker.advance_jog_override().unwrap();
+        worker.advance_feed_override().unwrap();
+        assert!(worker.jog_override.is_none());
+        assert_eq!(worker.user_feed, Some(50));
+        assert!(!worker.s.feed_override_pending);
+    }
+
+    #[test]
+    fn job_end_blocks_run_until_a_new_report_confirms_the_selected_feed() {
+        let (_sim, mut worker) = connected_worker();
+        worker.s.ready = true;
+        worker.line("<Idle|MPos:10,20,0|Ov:50,100,100>").unwrap();
+        worker.finish();
+        worker.queue.clear();
+        worker.advance_feed_override().unwrap();
+        assert!(
+            !worker.s.can_run(),
+            "A pre-completion report is insufficient"
+        );
+        worker.line("<Idle|MPos:10,20,0|Ov:100,100,100>").unwrap();
+        worker.advance_feed_override().unwrap();
+        assert!(!worker.s.can_run());
+        assert!(worker.action(Action::Run).is_err());
+        // Expire restoration without confirmation: keep Run blocked and retry.
+        worker.feed_restore_sent = Some(Instant::now() - Duration::from_secs(4));
+        assert!(worker.advance_feed_override().is_err());
+        assert!(!worker.s.can_run());
+        worker.line("<Idle|MPos:10,20,0|Ov:50,100,100>").unwrap();
+        worker.advance_feed_override().unwrap();
+        assert!(worker.s.can_run());
+        assert_eq!(worker.user_feed, Some(50));
     }
 
     #[test]

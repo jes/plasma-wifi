@@ -263,6 +263,18 @@ impl Machine {
                 block.path[i].lerp(block.path[(i + 1).min(block.path.len() - 1)], f - i as f64);
         }
         if self.block_seconds >= duration {
+            // FluidNC synchronizes M2/M30 with physical completion, then
+            // resets the override registers before ending the file.
+            if code.split('M').skip(1).any(|word| {
+                let value = word.split(|ch: char| ch.is_ascii_alphabetic()).next();
+                matches!(value.and_then(|v| v.parse::<f64>().ok()), Some(2.0 | 30.0))
+            }) {
+                self.feed = 1.0;
+                self.rapid = 1.0;
+                self.program = None;
+                self.torch = false;
+                self.complete = true;
+            }
             self.block += 1;
             self.block_seconds = 0.0;
         }
@@ -1034,6 +1046,64 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn repeated_jobs_restore_the_latest_user_feed_after_m2_and_m30() {
+        for end in ["M2", "M30"] {
+            let sim = Simulator::start().unwrap();
+            let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
+            wait(&controller, |s| {
+                s.initialized && s.jog_override_supported == Some(true)
+            });
+            for _ in 0..5 {
+                controller.send(Action::Feed(0x92));
+            }
+            controller.send(Action::Load {
+                name: "repeat.nc".into(),
+                text: format!("G21G91G94\nG1X5F600\n{end}\n"),
+            });
+            let ready = wait(&controller, |s| s.can_run());
+            assert_eq!(ready.status.feed_override, 0.5);
+            controller.send(Action::Run);
+            let running = wait(&controller, |s| s.job && s.status.state == "Run");
+            assert_eq!(running.status.feed_override, 0.5);
+            // A change made during the first job must become the next job's setting.
+            controller.send(Action::Feed(0x92));
+            wait(&controller, |s| s.job && s.status.feed_override == 0.4);
+            let done = wait(&controller, |s| !s.job && s.progress == 1.0 && s.can_run());
+            assert_eq!(done.status.feed_override, 0.4, "{end}");
+            assert!((sim.machine.lock().unwrap().feed - 0.4).abs() < 0.001);
+            controller.send(Action::Run);
+            let second = wait(&controller, |s| s.job && s.status.state == "Run");
+            assert_eq!(second.status.feed_override, 0.4, "{end}");
+            let done = wait(&controller, |s| !s.job && s.progress == 1.0 && s.can_run());
+            assert_eq!(done.status.feed_override, 0.4, "{end}");
+        }
+    }
+
+    #[test]
+    fn user_feed_survives_stop_and_reconnect_without_a_borrowed_jog_override() {
+        let sim = Simulator::start().unwrap();
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
+        wait(&controller, |s| {
+            s.initialized && s.jog_override_supported == Some(true)
+        });
+        for _ in 0..5 {
+            controller.send(Action::Feed(0x92));
+        }
+        wait(&controller, |s| {
+            s.status.feed_override == 0.5 && !s.feed_override_pending
+        });
+        controller.send(Action::Stop);
+        wait(&controller, |s| s.status.state == "Connecting");
+        let stopped = wait(&controller, |s| s.initialized && !s.feed_override_pending);
+        assert_eq!(stopped.status.feed_override, 0.5);
+        sim.disconnect();
+        wait(&controller, |s| !s.connected);
+        sim.machine.lock().unwrap().feed = 1.0;
+        let reconnected = wait(&controller, |s| s.initialized && !s.feed_override_pending);
+        assert_eq!(reconnected.status.feed_override, 0.5);
     }
     struct CheckpointFile(std::path::PathBuf);
     impl CheckpointFile {

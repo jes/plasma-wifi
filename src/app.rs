@@ -1303,6 +1303,7 @@ impl App {
                     && self.snapshot.status.idle()
                     && !self.snapshot.jog_restarting
                     && !self.snapshot.jog_override_active
+                    && !self.snapshot.feed_override_pending
                     && !self.snapshot.jog_detecting
                     && self.snapshot.program.is_some()
                     && !self.snapshot.status.torch,
