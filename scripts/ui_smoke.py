@@ -500,7 +500,7 @@ try:
     time.sleep(0.2)
     start=state()
     previous=len(start["commands"])
-    click(135, 924)  # Trace hull at jog speed
+    click(135, 873)  # Trace hull at jog speed
     wait(lambda s: s["state"]=="Run" and abs(s["feed_override"]-0.25)<0.001, "Hull trace did not start as normal feed motion")
     screenshot("hull-trace.png")
     target=f"G21G90G94G1X{start['x']:.5f}Y{start['y']:.5f}F2400.0"
@@ -511,7 +511,7 @@ try:
     assert not traced["torch"], "Hull trace lit the torch"
     assert not any(c.startswith("$J=") for c in traced["commands"][previous:]), "Hull trace used jog commands"
     time.sleep(0.3)
-    click(135, 924)
+    click(135, 873)
     wait(lambda s: s["state"]=="Run" and abs(s["feed_override"]-0.25)<0.001, "Second hull trace did not start")
     command("keydown", "Shift_L")
     wait(lambda s: s["state"]=="Run" and abs(s["feed_override"]-1.0)<0.001,
@@ -519,7 +519,7 @@ try:
     command("keyup", "Shift_L")
     wait(lambda s: s["state"]=="Run" and abs(s["feed_override"]-0.25)<0.001,
          "Releasing Shift did not slow the active hull trace through realtime feed override")
-    click(135, 924)  # Cancel hull trace
+    click(135, 873)  # Cancel hull trace
     wait(lambda s: s["state"]=="Idle" and abs(s["feed_override"]-start["feed_override"])<0.001,
          "Hull cancellation did not stop motion and restore feed override")
     time.sleep(0.3)

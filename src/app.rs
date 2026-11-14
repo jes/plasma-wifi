@@ -409,6 +409,11 @@ pub struct App {
     source_path: Option<PathBuf>,
     wifi_rescan: Option<Receiver<anyhow::Result<()>>>,
     wifi_notice: String,
+    wifi_monitor: crate::wifi::Monitor,
+    wifi_address: String,
+    wifi: crate::wifi::Snapshot,
+    wifi_details: bool,
+    wifi_height: f32,
     preview_menu_point: Option<Point>,
     preview_menu_open: bool,
     dro: [String; 2],
@@ -456,12 +461,18 @@ impl App {
             settings.http.clone(),
             (!demo).then(crate::coordinates::Coordinates::path),
         );
+        let wifi_monitor = crate::wifi::Monitor::start(settings.address.clone(), demo);
         Self {
             controller,
             snapshot: Snapshot::default(),
             source_path: None,
             wifi_rescan: None,
             wifi_notice: String::new(),
+            wifi_address: settings.address.clone(),
+            wifi_monitor,
+            wifi: crate::wifi::Snapshot::default(),
+            wifi_details: false,
+            wifi_height: 140.0,
             preview_menu_point: None,
             preview_menu_open: false,
             settings,
@@ -579,6 +590,16 @@ impl App {
     }
     pub fn ui(&mut self, root: &mut egui::Ui) {
         self.snapshot = self.controller.snapshot();
+        if !self.snapshot.controller_address.is_empty() {
+            self.wifi_address = self.snapshot.controller_address.clone();
+        }
+        self.wifi = self.wifi_monitor.snapshot(
+            &self.wifi_address,
+            self.snapshot
+                .connected
+                .then_some(self.snapshot.peer_ip)
+                .flatten(),
+        );
         if let Some(scan) = &self.wifi_rescan {
             match scan.try_recv() {
                 Ok(Ok(())) => {
@@ -678,6 +699,7 @@ impl App {
             && ctx.input(|i| i.focused)
             && self.picker.is_none()
             && !self.settings_open
+            && !self.wifi_details
             && !self.log_open
             && !self.files_open
             && let Some(shortcut) = ctx.input_mut(|i| take_shortcut(&mut i.events))
@@ -854,7 +876,34 @@ impl App {
             let preview_height = (ui.available_height() * 0.52).max(140.0);
             self.preview(ui, preview_height);
             panel_divider(ui, ui.max_rect().x_range().expand(8.0), 5.0);
-            self.code_view(ui);
+            let remaining = ui.available_rect_before_wrap();
+            let height = self.wifi_height.min((remaining.height() - 80.0).max(60.0));
+            let diagnostics = egui::Rect::from_min_max(
+                Pos2::new(remaining.left(), remaining.bottom() - height),
+                remaining.max,
+            );
+            let code = egui::Rect::from_min_max(
+                remaining.min,
+                Pos2::new(remaining.right(), diagnostics.top() - 6.0),
+            );
+            ui.painter().hline(
+                ui.max_rect().x_range().expand(8.0),
+                diagnostics.top() - 3.0,
+                Stroke::new(1.0_f32, BORDER),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(code), |ui| {
+                ui.set_clip_rect(ui.clip_rect().intersect(code));
+                self.code_view(ui);
+            });
+            ui.scope_builder(egui::UiBuilder::new().max_rect(diagnostics), |ui| {
+                ui.set_clip_rect(ui.clip_rect().intersect(diagnostics));
+                let scroll = egui::ScrollArea::vertical()
+                    .id_salt("wifi_diagnostics")
+                    .max_height(height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| self.wifi_panel(ui));
+                self.wifi_height = scroll.content_size.y + 4.0;
+            });
         });
         root.painter().rect_stroke(
             root.max_rect(),
@@ -864,6 +913,153 @@ impl App {
         );
         self.dialogs(root);
         self.jog_input(&ctx);
+    }
+    fn wifi_panel(&mut self, ui: &mut egui::Ui) {
+        use crate::wifi::{EventKind, Kind};
+        ui.horizontal_wrapped(|ui| {
+            let title = match self.wifi.kind {
+                Kind::Demo => "WI-FI · simulated".into(),
+                Kind::Wireless => format!(
+                    "WI-FI · {}{}",
+                    self.wifi.interface.as_deref().unwrap_or("—"),
+                    if self.wifi.route_current {
+                        ""
+                    } else {
+                        " · last used; route unavailable"
+                    }
+                ),
+                Kind::Other => format!(
+                    "NETWORK · {} · non-Wi-Fi route",
+                    self.wifi.interface.as_deref().unwrap_or("—")
+                ),
+                Kind::Checking => "WI-FI · checking controller route…".into(),
+                Kind::Unavailable => "WI-FI · diagnostics unavailable".into(),
+            };
+            ui.strong(title);
+            if ui.small_button("Details").clicked() {
+                self.wifi_details = true;
+            }
+            if let Some(at) = self.wifi.sampled_at {
+                let age = at.elapsed().as_secs_f64();
+                ui.small(format!("sample {age:.0}s ago"));
+            }
+            if self.wifi.kind == Kind::Wireless {
+                ui.colored_label(
+                    match self.wifi.associated {
+                        Some(true) => GREEN,
+                        Some(false) => RED,
+                        None => MUTED,
+                    },
+                    match self.wifi.associated {
+                        Some(true) => "associated",
+                        Some(false) => "not associated",
+                        None => "association unknown",
+                    },
+                );
+            }
+        });
+        if matches!(self.wifi.kind, Kind::Wireless | Kind::Demo) {
+            let stale = self.wifi.kind != Kind::Demo
+                && self
+                    .wifi
+                    .sampled_at
+                    .is_none_or(|at| at.elapsed().as_secs() > 4);
+            let low = |value: Option<f64>, warning: f64, bad: f64| {
+                value.map(|v| {
+                    if v < bad {
+                        RED
+                    } else if v < warning {
+                        ORANGE
+                    } else {
+                        GREEN
+                    }
+                })
+            };
+            let high = |value: Option<f64>, warning: f64, bad: f64| {
+                value.map(|v| {
+                    if v >= bad {
+                        RED
+                    } else if v >= warning {
+                        ORANGE
+                    } else {
+                        GREEN
+                    }
+                })
+            };
+            let mut metrics = Vec::new();
+            for (label, value, units, colour) in [
+                (
+                    "Signal",
+                    self.wifi.signal,
+                    "dBm",
+                    low(self.wifi.signal, -70.0, -80.0),
+                ),
+                (
+                    "TX",
+                    self.wifi.tx_bitrate,
+                    "Mb/s",
+                    low(self.wifi.tx_bitrate, 12.0, 6.0),
+                ),
+                (
+                    "RX",
+                    self.wifi.rx_bitrate,
+                    "Mb/s",
+                    low(self.wifi.rx_bitrate, 12.0, 6.0),
+                ),
+                (
+                    "Retries",
+                    self.wifi.retries_per_second,
+                    "/s",
+                    high(self.wifi.retries_per_second, 5.0, 20.0),
+                ),
+                (
+                    "Failed",
+                    self.wifi.failures_per_second,
+                    "/s",
+                    high(self.wifi.failures_per_second, f64::EPSILON, 2.0),
+                ),
+            ] {
+                let value = if stale { None } else { value };
+                metrics.push((
+                    label,
+                    value.map(|v| format!("{v:.1} {units}")),
+                    if stale { None } else { colour },
+                ));
+            }
+            let beacons = if stale { None } else { self.wifi.beacon_losses };
+            metrics.push((
+                "Beacon loss",
+                beacons
+                    .zip(self.wifi.window_seconds)
+                    .map(|(n, s)| format!("{n} / {s:.0}s")),
+                high(beacons.map(|n| n as f64), 1.0, 3.0),
+            ));
+            for (label, kind) in [
+                ("Disconnects", EventKind::Disconnect),
+                ("Deauth/disassoc", EventKind::Deauthentication),
+                ("Reconnects", EventKind::Reconnect),
+                ("Auth", EventKind::Authentication),
+                ("Beacon events", EventKind::BeaconLoss),
+            ] {
+                let count = self.wifi.event_count(kind);
+                metrics.push((
+                    label,
+                    count.map(|n| format!("{n} / 60s")),
+                    high(count.map(|n| n as f64), 1.0, 3.0),
+                ));
+            }
+            wifi_metrics(ui, metrics);
+            if let Some(event) = self.wifi.events.back() {
+                ui.small(format!(
+                    "Last event · {:.0}s ago · {}",
+                    event.at.elapsed().as_secs_f64(),
+                    event.text
+                ));
+            }
+        }
+        if let Some(note) = self.wifi.notes.first() {
+            ui.small(note);
+        }
     }
     fn state_label(&self) -> (String, Color32) {
         let state = &self.snapshot.status.state;
@@ -1164,7 +1360,7 @@ impl App {
             self.snapshot.status.feed
         ));
         panel_divider(ui, columns, 12.0);
-        ui.label(RichText::new("JOG  /  tap or hold").strong());
+        ui.label(RichText::new("JOG").strong());
         if self.snapshot.connected
             && (self.snapshot.acceleration.iter().any(Option::is_none)
                 || self.snapshot.planner_blocks.is_none())
@@ -1281,9 +1477,6 @@ impl App {
         );
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new("pointer_jog"), pointer_jog));
-        ui.small("Hold Shift: ×4 jog speed");
-        ui.small("Tap: one increment · release hold: stop");
-        ui.small("Arrow keys: X/Y · Esc: cancel jog");
         ui.small(format!(
             "Torch: {}",
             if self.snapshot.status.torch {
@@ -1318,7 +1511,6 @@ impl App {
                 boosted: ui.input(|input| input.modifiers.shift),
             });
         }
-        ui.small("X/Y: edit position · G/M: console");
     }
     fn jog_input(&mut self, ctx: &egui::Context) {
         if self.snapshot.tracing {
@@ -1338,6 +1530,7 @@ impl App {
         let interrupted = !ctx.input(|i| i.focused)
             || self.picker.is_some()
             || self.settings_open
+            || self.wifi_details
             || self.console_open
             || self.log_open
             || self.files_open
@@ -1439,7 +1632,6 @@ impl App {
                 self.pan = Vec2::ZERO;
             }
             ui.checkbox(&mut self.show_hull, "Hull");
-            ui.small("Wheel: zoom · drag: pan");
         });
         let (response, painter) = ui.allocate_painter(
             Vec2::new(ui.available_width(), height),
@@ -1671,7 +1863,6 @@ impl App {
             if ui.checkbox(&mut self.auto_scroll, "Auto-scroll").changed() {
                 self.scroll_to_active = true;
             }
-            ui.small("Ctrl+scroll: UI size");
         });
         let Some(program) = &self.snapshot.program else {
             return;
@@ -1776,6 +1967,29 @@ impl App {
     }
     fn dialogs(&mut self, root: &mut egui::Ui) {
         let ctx = root.ctx().clone();
+        if self.wifi_details {
+            egui::Window::new("Wi-Fi measurements")
+                .open(&mut self.wifi_details)
+                .default_width(620.0)
+                .show(&ctx, |ui| {
+                    if let Some(ip) = self.wifi.destination { ui.label(format!("Controller route: {ip}")); }
+                    if let Some(ssid) = &self.wifi.ssid { ui.label(format!("SSID: {ssid}")); }
+                    if let Some(bssid) = &self.wifi.bssid { ui.label(format!("Access point: {bssid}")); }
+                    ui.label("TX/RX are reported Wi-Fi link rates, not measured throughput. Colours are rough guides; low idle rates can be normal.");
+                    ui.label("Retries and failures are counter increases per second, averaged over up to about 10 seconds. Beacon losses show the count over the displayed sampling interval. Counters reset on reassociation or a driver reset.");
+                    ui.label("Signal colour: amber below −70 dBm, red below −80. Link rate colour: amber below 12 Mb/s, red below 6. Retry colour: amber from 5/s, red from 20/s. Failures: amber above zero, red from 2/s. These are advisory thresholds.");
+                    ui.label("Event counts cover the last 60 seconds observed by this app. Authentication events include attempts; they do not necessarily indicate failure. Duplicate reports within 2 seconds are combined.");
+                    for note in &self.wifi.notes { ui.colored_label(ORANGE, note); }
+                    ui.separator();
+                    ui.strong("Recent events");
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        for event in self.wifi.events.iter().rev() {
+                            ui.label(format!("{:.0}s ago · {}", event.at.elapsed().as_secs_f64(), event.text));
+                        }
+                        if self.wifi.events.is_empty() { ui.label("No events observed."); }
+                    });
+                });
+        }
         if self.settings_open {
             let mut open = true;
             let mut apply = false;
@@ -1800,6 +2014,40 @@ impl App {
                     {
                         apply = true;
                     }
+                    ui.separator();
+                    ui.collapsing("Controls and shortcuts", |ui| {
+                        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                            egui::Grid::new("controls_reference")
+                                .num_columns(2)
+                                .spacing([16.0, 8.0])
+                                .max_col_width(280.0)
+                                .show(ui, |ui| {
+                                    for (action, keys) in [
+                                        ("Open G-code", "O or Ctrl+O"),
+                                        ("Run / resume", "R"),
+                                        ("Pause / resume", "P"),
+                                        ("Stop", "S"),
+                                        ("Edit work position", "X / Y · Enter applies · /2 halves"),
+                                        ("Jog speed / increment", "F / I · Enter applies"),
+                                        ("Jog", "Arrow keys or direction buttons · tap steps, hold travels"),
+                                        ("Stop held jogging", "Release the held direction"),
+                                        ("Jog / trace boost", "Hold Shift for ×4 speed"),
+                                        ("Cancel jogging", "Escape"),
+                                        ("Preview", "Wheel zooms · drag pans"),
+                                        ("Preview position", "Ctrl-click to jog · right-click for actions"),
+                                        ("UI size", "Ctrl+scroll anywhere"),
+                                        ("Open console", "G / M opens with that prefix"),
+                                        ("Console", "Enter sends · Escape closes · Up/Down recalls history"),
+                                    ] {
+                                        ui.label(RichText::new(action).strong());
+                                        ui.label(keys);
+                                        ui.end_row();
+                                    }
+                                });
+                            ui.add_space(8.0);
+                            ui.small("Letter shortcuts leave text fields and dialogs alone. Console commands are available in every controller state.");
+                        });
+                    });
                 });
             self.settings_open = open;
             if apply {
@@ -1957,23 +2205,25 @@ impl App {
                     let id = egui::Id::new("fluidnc_console_command");
                     self.console_input_id = Some(id);
                     let mut output = egui::TextEdit::singleline(&mut self.console_input)
-                            .id(id)
-                            .desired_width((ui.available_width() - 65.0).max(100.0))
-                            .font(egui::TextStyle::Monospace)
-                            .hint_text("FluidNC command")
-                            .show(ui);
+                        .id(id)
+                        .desired_width((ui.available_width() - 65.0).max(100.0))
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("FluidNC command")
+                        .show(ui);
                     let field = output.response;
                     if self.console_focus && ui.is_visible() {
                         field.request_focus();
-                        output.state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
-                            egui::text::CCursor::new(self.console_input.chars().count()),
-                        )));
+                        output
+                            .state
+                            .cursor
+                            .set_char_range(Some(egui::text::CCursorRange::one(
+                                egui::text::CCursor::new(self.console_input.chars().count()),
+                            )));
                         output.state.store(ctx, id);
                         self.console_focus = false;
                     }
                     if field.has_focus() || field.lost_focus() {
-                        if ui.input(|i| i.key_pressed(egui::Key::ArrowUp))
-                            && self.console_index > 0
+                        if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) && self.console_index > 0
                         {
                             if self.console_index == self.console_history.len() {
                                 self.console_draft = self.console_input.clone();
@@ -1985,13 +2235,15 @@ impl App {
                             && self.console_index < self.console_history.len()
                         {
                             self.console_index += 1;
-                            self.console_input = self.console_history
-                                .get(self.console_index).cloned()
+                            self.console_input = self
+                                .console_history
+                                .get(self.console_index)
+                                .cloned()
                                 .unwrap_or_else(|| self.console_draft.clone());
                         }
                     }
-                    let submit = self.console_submit || field.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let submit = self.console_submit
+                        || field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     self.console_submit = false;
                     let submit = ui.button("Send").clicked() || submit;
                     if submit && !self.console_input.trim().is_empty() {
@@ -2007,10 +2259,11 @@ impl App {
                         self.console_input.clear();
                         self.console_draft.clear();
                         self.controller.send(Action::Console(command));
-                        if !field.has_focus() { field.request_focus(); }
+                        if !field.has_focus() {
+                            field.request_focus();
+                        }
                     }
                 });
-                ui.small("Esc closes · Enter sends · Up/Down recall · commands are available in every controller state");
             });
         self.console_open = open;
         if !open && let Some(id) = self.console_input_id {
@@ -2054,6 +2307,63 @@ fn take_shortcut(events: &mut Vec<egui::Event>) -> Option<char> {
     }
     Some(prefix)
 }
+type WifiMetric = (&'static str, Option<String>, Option<Color32>);
+fn wifi_metrics(ui: &mut egui::Ui, metrics: Vec<WifiMetric>) {
+    let width = ui.available_width();
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let mut rows: Vec<Vec<WifiMetric>> = vec![vec![]];
+    let mut used = 0.0;
+    for metric in metrics {
+        let text = format!(
+            "{} {}",
+            metric.0,
+            metric.1.as_deref().unwrap_or("unavailable")
+        );
+        let item_width = ui
+            .painter()
+            .layout_no_wrap(text, font.clone(), TEXT)
+            .size()
+            .x
+            + 8.0
+            + ui.spacing().item_spacing.x;
+        if used > 0.0 && used + item_width > width {
+            rows.push(vec![]);
+            used = 0.0;
+        }
+        used += item_width;
+        rows.last_mut().unwrap().push(metric);
+    }
+    for row in rows {
+        ui.horizontal(|ui| {
+            for (label, value, colour) in row {
+                wifi_metric(ui, label, value, colour);
+            }
+        });
+    }
+}
+fn wifi_metric(ui: &mut egui::Ui, label: &str, value: Option<String>, colour: Option<Color32>) {
+    let colour = colour.unwrap_or(MUTED);
+    egui::Frame::new()
+        .fill(Color32::from_rgb(
+            colour.r() / 5,
+            colour.g() / 5,
+            colour.b() / 5,
+        ))
+        .corner_radius(3.0)
+        .inner_margin(4.0)
+        .show(ui, |ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "{label} {}",
+                        value.as_deref().unwrap_or("unavailable")
+                    ))
+                    .color(colour),
+                )
+                .wrap_mode(egui::TextWrapMode::Extend),
+            );
+        });
+}
 fn duration(seconds: f64) -> String {
     if !seconds.is_finite() {
         return "—".into();
@@ -2065,6 +2375,65 @@ fn duration(seconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wifi_readings_wrap_into_rows_without_clipping_individual_values() {
+        for width in [320.0, 640.0, 820.0] {
+            let ctx = egui::Context::default();
+            configure_style(&ctx);
+            let metrics = [
+                "Signal",
+                "TX",
+                "RX",
+                "Retries",
+                "Failed",
+                "Beacon loss",
+                "Disconnects",
+                "Deauth/disassoc",
+                "Reconnects",
+                "Auth",
+                "Beacon events",
+            ];
+            for frame in 0..3 {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(width, 600.0),
+                        )),
+                        time: Some(frame as f64 / 30.0),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default().show_inside(ui, |ui| {
+                            wifi_metrics(
+                                ui,
+                                metrics
+                                    .iter()
+                                    .map(|&label| (label, Some("12.3 /s".into()), Some(GREEN)))
+                                    .collect(),
+                            );
+                        });
+                    },
+                );
+                if frame == 2 {
+                    let mut count = 0;
+                    for shape in &output.shapes {
+                        if let egui::Shape::Text(text) = &shape.shape {
+                            let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                            assert!(
+                                shape.clip_rect.contains_rect(rect),
+                                "Clipped Wi-Fi value at width {width}: {}",
+                                text.galley.job.text
+                            );
+                            count += 1;
+                        }
+                    }
+                    assert_eq!(count, metrics.len());
+                }
+            }
+        }
+    }
 
     #[test]
     fn console_layout_stays_fixed_during_hidden_status_updates() {

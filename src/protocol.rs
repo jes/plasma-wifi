@@ -194,6 +194,9 @@ impl Link {
             .write_all(bytes)
             .context("Controller write failed")
     }
+    pub fn peer_ip(&self) -> Option<std::net::IpAddr> {
+        self.stream.peer_addr().ok().map(|address| address.ip())
+    }
     pub fn command(&mut self, command: &str) -> Result<()> {
         self.send(format!("{command}\n").as_bytes())
     }

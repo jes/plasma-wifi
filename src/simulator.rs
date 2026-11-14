@@ -1029,6 +1029,7 @@ mod tests {
         controller.send(Action::Stop);
         wait(&controller, |s| !s.job && s.status.idle());
     }
+    #[track_caller]
     fn wait(controller: &Controller, condition: impl Fn(&Snapshot) -> bool) -> Snapshot {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -1038,11 +1039,15 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "Timed out: state={} phase={} error={:?} upload={}",
+                "Timed out: state={} phase={} error={:?} upload={} initialized={} feed={} feed_pending={} jog_support={:?}",
                 s.status.state,
                 s.phase,
                 s.error,
-                s.upload
+                s.upload,
+                s.initialized,
+                s.status.feed_override,
+                s.feed_override_pending,
+                s.jog_override_supported
             );
             thread::sleep(Duration::from_millis(20));
         }
@@ -1095,8 +1100,20 @@ mod tests {
         wait(&controller, |s| {
             s.status.feed_override == 0.5 && !s.feed_override_pending
         });
+        let banners = controller
+            .snapshot()
+            .console
+            .iter()
+            .filter(|line| line.starts_with("Grbl "))
+            .count();
         controller.send(Action::Stop);
-        wait(&controller, |s| s.status.state == "Connecting");
+        wait(&controller, |s| {
+            s.console
+                .iter()
+                .filter(|line| line.starts_with("Grbl "))
+                .count()
+                > banners
+        });
         let stopped = wait(&controller, |s| s.initialized && !s.feed_override_pending);
         assert_eq!(stopped.status.feed_override, 0.5);
         sim.disconnect();

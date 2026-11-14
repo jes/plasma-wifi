@@ -91,6 +91,8 @@ pub enum Action {
 #[derive(Clone)]
 pub struct Snapshot {
     pub connected: bool,
+    pub controller_address: String,
+    pub peer_ip: Option<std::net::IpAddr>,
     pub status: Status,
     pub ready: bool,
     pub transferring: bool,
@@ -131,6 +133,8 @@ impl Default for Snapshot {
     fn default() -> Self {
         Self {
             connected: false,
+            controller_address: String::new(),
+            peer_ip: None,
             status: Status::default(),
             ready: false,
             transferring: false,
@@ -557,12 +561,16 @@ impl Worker {
         shared: Arc<Mutex<Snapshot>>,
     ) -> Self {
         let now = Instant::now();
+        let s = Snapshot {
+            controller_address: address.clone(),
+            ..Default::default()
+        };
         Self {
             address,
             http,
             rx,
             shared,
-            s: Snapshot::default(),
+            s,
             link: None,
             console_link: None,
             console_pending: VecDeque::new(),
@@ -655,6 +663,7 @@ impl Worker {
                 self.reconnect = now + Duration::from_secs(2);
                 match Link::connect(&self.address) {
                     Ok(link) => {
+                        self.s.peer_ip = link.peer_ip();
                         self.link = Some(link);
                         self.s.jog_override_supported = None;
                         self.jog_probe_after = Instant::now();
@@ -1877,6 +1886,8 @@ impl Worker {
                     self.cancel_trace_on_connect = self.trace_restore.is_some();
                 }
                 self.address = address;
+                self.s.controller_address = self.address.clone();
+                self.s.peer_ip = None;
                 self.http = http.trim_end_matches('/').into();
                 self.disconnected("Connection settings changed".into());
                 self.reconnect = Instant::now();
