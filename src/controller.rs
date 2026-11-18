@@ -900,7 +900,9 @@ impl Worker {
             anyhow::bail!("Controller handshake timed out");
         }
         if self.pending.as_ref().is_some_and(|(cmd, t)| {
-            !cmd.trace && !cmd.starts_with("$LocalFS/Run=") && t.elapsed() > Duration::from_secs(5)
+            !(cmd.trace && self.trace.is_some())
+                && !cmd.starts_with("$LocalFS/Run=")
+                && t.elapsed() > Duration::from_secs(5)
         }) {
             anyhow::bail!("Controller command timed out; it will not be repeated");
         }
@@ -1405,8 +1407,12 @@ impl Worker {
                 trace.sent = Some(Instant::now());
             }
             if line.starts_with("error:") {
-                self.fail(format!("{cmd}: {line}"));
-                if cmd.trace {
+                if cmd.trace && self.trace.is_none() && self.trace_restore.is_some() {
+                    self.fail_trace_restore(format!("{cmd}: {line}"));
+                } else {
+                    self.fail(format!("{cmd}: {line}"));
+                }
+                if cmd.trace && self.trace.is_some() {
                     self.action(Action::Stop)?;
                 }
                 if matches!(self.coordinate_recovery, CoordinateRecovery::Writing)
@@ -2006,7 +2012,7 @@ impl Worker {
                 });
             }
             Action::CancelTrace => {
-                if self.trace.is_some() {
+                if self.trace.is_some() || self.trace_restore.is_some() {
                     self.action(Action::Stop)?;
                 }
             }
@@ -2546,13 +2552,23 @@ impl Worker {
     fn queue_trace(&mut self, text: String) {
         self.queue.push_back(QueuedCommand { text, trace: true });
     }
+    fn fail_trace_restore(&mut self, reason: String) {
+        if let Some(restore) = &mut self.trace_restore {
+            restore.phase = RestorePhase::Failed;
+        }
+        self.queue.retain(|cmd| !cmd.trace);
+        self.s.phase = "Hull trace restoration failed".into();
+        self.fail(format!(
+            "Hull trace restoration failed: {reason}. Use Cancel hull trace or Stop to retry"
+        ));
+    }
     fn advance_trace_restore(&mut self) -> Result<()> {
         let Some(restore) = &self.trace_restore else {
             return Ok(());
         };
         if matches!(
             restore.phase,
-            RestorePhase::Tracing | RestorePhase::WaitingReset
+            RestorePhase::Tracing | RestorePhase::WaitingReset | RestorePhase::Failed
         ) || !self.s.connected
             || !self.s.status.fresh()
             || self.stopping.is_some()
@@ -2567,7 +2583,10 @@ impl Worker {
         }
         match restore.phase {
             RestorePhase::WaitingIdle if !alarm => {
-                let modal = restore.saved.modal.clone();
+                let modal = restore.saved.modal_restore();
+                if modal != restore.saved.modal {
+                    self.s.log("Restoring trace modes with G0; saved motion mode cannot be restored as a stationary command");
+                }
                 self.queue_trace(modal);
                 self.queue_trace("$G".into());
                 self.trace_restore.as_mut().unwrap().phase = RestorePhase::ModalQueued;
@@ -2588,9 +2607,7 @@ impl Worker {
                     self.s.phase = restore.outcome.clone();
                     self.s.log(restore.outcome);
                 } else if sent.elapsed() > Duration::from_secs(3) {
-                    anyhow::bail!(
-                        "Feed override restoration not confirmed; motion remains blocked"
-                    );
+                    self.fail_trace_restore("Feed override restoration not confirmed".into());
                 } else if self.poll.elapsed() > Duration::from_millis(50) {
                     self.realtime(b"?")?;
                     self.poll = Instant::now();
@@ -3746,6 +3763,95 @@ mod tests {
         worker.line("<Idle|MPos:10,20,0|Ov:100,100,100>").unwrap();
         worker.advance_trace_restore().unwrap();
         assert!(!worker.s.tracing && worker.trace_restore.is_none());
+    }
+
+    #[test]
+    fn cancel_trace_restarts_recovery_in_every_restore_phase() {
+        for phase in [
+            RestorePhase::WaitingReset,
+            RestorePhase::WaitingIdle,
+            RestorePhase::ModalQueued,
+            RestorePhase::Override {
+                sent: Instant::now(),
+            },
+            RestorePhase::Failed,
+        ] {
+            let (_sim, mut worker) = connected_worker();
+            start_trace(&mut worker);
+            worker.trace = None;
+            worker.trace_restore.as_mut().unwrap().phase = phase;
+            worker.queue_trace("$G".into());
+            worker.action(Action::CancelTrace).unwrap();
+            assert!(worker.stopping.is_some());
+            assert!(worker.s.tracing && worker.queue.is_empty());
+            assert!(matches!(
+                worker.trace_restore.as_ref().unwrap().phase,
+                RestorePhase::WaitingReset
+            ));
+            report_stopped(&mut worker, Point::default());
+            worker.advance_stop().unwrap();
+            assert!(worker.reset_wait.is_some());
+            assert!(matches!(
+                worker.trace_restore.as_ref().unwrap().phase,
+                RestorePhase::WaitingIdle
+            ));
+        }
+    }
+
+    #[test]
+    fn rejected_trace_restoration_blocks_motion_without_resetting_or_repeating() {
+        let (_sim, mut worker) = connected_worker();
+        start_trace(&mut worker);
+        worker.trace = None;
+        worker.trace_restore.as_mut().unwrap().phase = RestorePhase::WaitingIdle;
+        worker.advance_trace_restore().unwrap();
+        let command = worker.queue.pop_front().unwrap();
+        worker.pending = Some((command, Instant::now()));
+        worker.line("error:20").unwrap();
+        assert!(worker.queue.is_empty());
+        assert!(worker.stopping.is_none() && worker.reset_wait.is_none());
+        assert!(matches!(
+            worker.trace_restore.as_ref().unwrap().phase,
+            RestorePhase::Failed
+        ));
+        assert!(worker.s.tracing && !worker.s.can_jog() && !worker.s.can_run());
+        assert!(worker.trace_recovery.get(&worker.address).is_some());
+        assert!(
+            worker
+                .s
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Cancel hull trace")
+        );
+        let logs = worker.s.console.len();
+        for _ in 0..10 {
+            worker.advance_trace_restore().unwrap();
+        }
+        assert_eq!(worker.s.console.len(), logs);
+        assert!(worker.queue.is_empty());
+        worker.action(Action::CancelTrace).unwrap();
+        assert!(worker.stopping.is_some());
+    }
+
+    #[test]
+    fn trace_override_restore_timeout_reports_once_and_allows_cancellation() {
+        let (_sim, mut worker) = connected_worker();
+        start_trace(&mut worker);
+        worker.trace = None;
+        worker.trace_restore.as_mut().unwrap().phase = RestorePhase::Override {
+            sent: Instant::now() - Duration::from_secs(4),
+        };
+        worker.advance_trace_restore().unwrap();
+        assert!(matches!(
+            worker.trace_restore.as_ref().unwrap().phase,
+            RestorePhase::Failed
+        ));
+        let logs = worker.s.log.len();
+        worker.advance_trace_restore().unwrap();
+        assert_eq!(worker.s.log.len(), logs);
+        worker.action(Action::CancelTrace).unwrap();
+        assert!(worker.stopping.is_some());
     }
 
     #[test]

@@ -7,6 +7,27 @@ pub struct SavedTrace {
     pub feed: u8,
     pub modal: String,
 }
+impl SavedTrace {
+    pub fn modal_restore(&self) -> String {
+        // FluidNC rejects explicit G2/G3 without axes/arc geometry, and G1
+        // with F0. Use G0 for those modes: restoration must never move the head.
+        // Apply this when sending, so existing recovery files work too.
+        let Some((modes, motion)) = self.modal.rsplit_once('G') else {
+            return self.modal.clone();
+        };
+        if motion.starts_with("2F")
+            || motion.starts_with("3F")
+            || motion
+                .strip_prefix("1F")
+                .and_then(|feed| feed.parse::<f64>().ok())
+                == Some(0.0)
+        {
+            format!("{modes}G0F{}", &motion[2..])
+        } else {
+            self.modal.clone()
+        }
+    }
+}
 
 /// Persist the borrowed controller state before changing it, so a closed app
 /// or lost connection cannot silently leave the next cutting job at trace feed.
@@ -63,6 +84,7 @@ pub enum RestorePhase {
     WaitingIdle,
     ModalQueued,
     Override { sent: std::time::Instant },
+    Failed,
 }
 
 pub struct TraceRestore {

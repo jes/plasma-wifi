@@ -393,6 +393,27 @@ impl Machine {
                 Err(_) => return "error:20\n".into(),
             }
         }
+        // FluidNC validates an explicit motion word even without axis words.
+        // In particular, a bare G2/G3 cannot be used to restore an arc mode.
+        if !command.starts_with('$') {
+            let motion = command
+                .match_indices('G')
+                .filter_map(|(index, _)| word(&command[index..], 'G'))
+                .find(|g| matches!(*g, 0.0 | 1.0 | 2.0 | 3.0));
+            if motion.is_some_and(|g| g != 0.0) {
+                let feed = word(command, 'F')
+                    .or_else(|| self.modal.get(&9).and_then(|s| word(s, 'F')))
+                    .unwrap_or(0.0);
+                if feed == 0.0 {
+                    return "error:22\n".into();
+                }
+                if matches!(motion, Some(2.0 | 3.0))
+                    && !['X', 'Y', 'Z'].iter().any(|axis| command.contains(*axis))
+                {
+                    return "error:26\n".into();
+                }
+            }
+        }
         if command.starts_with("G21G90G94G1") {
             if self.reject_stream {
                 return "error:20\n".into();
@@ -2107,6 +2128,84 @@ mod tests {
         assert!(!done.options.initial_mm && !done.options.initial_absolute);
         assert!((done.options.initial_feed - 304.8).abs() < 0.001);
         assert!(done.status.wpos.distance(Point::default()) < 0.001);
+    }
+
+    #[test]
+    fn trace_completion_after_arc_mode_does_not_enter_a_reset_loop() {
+        for motion in [2, 3] {
+            let sim = Simulator::legacy().unwrap();
+            // Model the parser state left by a previous arc, without moving.
+            sim.machine
+                .lock()
+                .unwrap()
+                .update_modals(&format!("G21G90G94G{motion}F600"));
+            let scratch = CheckpointFile::new();
+            let controller = scratch.start(&sim);
+            wait(&controller, |s| s.initialized && s.status.position_known);
+            controller.send(Action::Load {
+                name: "tiny.nc".into(),
+                text: "G21G90\nG1X1Y0F600\nY1\nX0\nY0".into(),
+            });
+            wait(&controller, |s| s.can_run());
+            controller.send(Action::TraceHull {
+                speed: 600.0,
+                boosted: true,
+            });
+            let done = wait(&controller, |s| {
+                s.phase.starts_with("Hull trace complete") && !s.tracing
+            });
+            assert!(done.error.is_none(), "{:?}", done.error);
+            assert_eq!(done.options.initial_motion, 0);
+            assert!(done.status.wpos.distance(Point::default()) < 0.001);
+            assert!(!done.console.iter().any(|line| line.contains("soft reset")));
+            assert!(
+                crate::trace::TraceRecovery::load(scratch.0.with_file_name("trace-restore.json"))
+                    .unwrap()
+                    .get(&sim.address)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn app_restart_recovers_legacy_arc_restore_without_deleting_state() {
+        for modal in ["G21G90G94G2F600", "G20G91G94G3F12", "G21G90G94G1F0"] {
+            let sim = Simulator::legacy().unwrap();
+            let scratch = CheckpointFile::new();
+            let recovery_path = scratch.0.with_file_name("trace-restore.json");
+            let mut recovery = crate::trace::TraceRecovery::load(recovery_path.clone()).unwrap();
+            recovery
+                .begin(
+                    &sim.address,
+                    crate::trace::SavedTrace {
+                        feed: 143,
+                        modal: modal.into(),
+                    },
+                )
+                .unwrap();
+            let start = seed_position(&sim);
+            sim.machine.lock().unwrap().feed = 0.25;
+            let controller = scratch.start(&sim);
+            let done = wait(&controller, |s| {
+                s.initialized && s.status.idle() && !s.tracing
+            });
+            assert!(done.error.is_none(), "{:?}", done.error);
+            assert!((done.status.feed_override - 1.43).abs() < 0.001);
+            assert_eq!(done.options.initial_motion, 0);
+            assert!(done.status.wpos.distance(start) < 0.001);
+            assert!(
+                crate::trace::TraceRecovery::load(recovery_path)
+                    .unwrap()
+                    .get(&sim.address)
+                    .is_none()
+            );
+            assert!(
+                !sim.commands()
+                    .iter()
+                    .any(|cmd| cmd != crate::jog_override::PROBE
+                        && (cmd.contains('X') || cmd.contains('Y')))
+            );
+        }
     }
 
     #[test]
