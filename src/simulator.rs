@@ -1422,6 +1422,22 @@ mod tests {
         restored(&controller, target);
     }
     #[test]
+    fn unknown_gcode_is_preserved_in_the_verified_controller_file() {
+        let sim = Simulator::legacy().unwrap();
+        let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);
+        wait(&controller, |s| s.initialized);
+        controller.send(Action::Load {
+            name: "passthrough.nc".into(),
+            text: "(CAM)\nN10 M65 P0\nG1X10F600\nM123Q2\nG38.2X1.234567F60\nM30".into(),
+        });
+        let ready = wait(&controller, |s| s.can_run());
+        let expected = "N1M65P0\nN2G1X10F600\nN3M123Q2\nN4G38.2X1.234567F60\nN5M30\n";
+        assert_eq!(ready.program.unwrap().uploaded, expected);
+        assert_eq!(sim.machine.lock().unwrap().file, expected);
+        protocol::verify(&sim.http, expected).unwrap();
+    }
+
+    #[test]
     fn full_upload_run_pause_restore_stop_and_reconnect() {
         let sim = Simulator::legacy().unwrap();
         let controller = Controller::start(sim.address.clone(), sim.http.clone(), None);

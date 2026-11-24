@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use std::f64::consts::TAU;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -199,10 +199,13 @@ struct Word {
     letter: char,
     value: f64,
     text: String,
+    original_text: String,
+    original_value: f64,
 }
 
 /// Compact words before analysis so the preview and timing match the uploaded coordinates.
-fn words(line: &str) -> Result<Vec<Word>> {
+/// None means the syntax must be passed through without preview interpretation.
+fn words(line: &str) -> Result<Option<Vec<Word>>> {
     let mut clean = String::new();
     let mut depth = 0;
     for c in line.chars() {
@@ -233,18 +236,16 @@ fn words(line: &str) -> Result<Vec<Word>> {
         "percent delimiters must be on a line by themselves"
     );
     if clean.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
     let chars: Vec<char> = clean.chars().collect();
     let mut i = 0;
     let mut out = Vec::new();
     while i < chars.len() {
         let letter = chars[i];
-        ensure!(
-            letter.is_ascii_alphabetic(),
-            "unsupported syntax near '{}'; expressions, checksums and macros are not supported",
-            &clean[i..]
-        );
+        if !letter.is_ascii_alphabetic() {
+            return Ok(None);
+        }
         i += 1;
         let start = i;
         if i < chars.len() && (chars[i] == '+' || chars[i] == '-') {
@@ -253,13 +254,16 @@ fn words(line: &str) -> Result<Vec<Word>> {
         while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
             i += 1;
         }
-        ensure!(i > start, "missing number after {letter}");
+        if i == start {
+            return Ok(None);
+        }
         let number: String = chars[start..i].iter().collect();
         let mut value: f64 = number
             .parse()
             .with_context(|| format!("invalid number {number}"))?;
         ensure!(value.is_finite(), "non-finite number");
         if letter != 'N' {
+            let original_value = value;
             let text = if matches!(letter, 'X' | 'Y' | 'Z' | 'I' | 'J' | 'K' | 'R') {
                 let rounded = format!("{value:.3}");
                 value = rounded.parse()?;
@@ -276,10 +280,25 @@ fn words(line: &str) -> Result<Vec<Word>> {
                 letter,
                 value,
                 text,
+                original_text: format!("{letter}{number}"),
+                original_value,
             });
         }
     }
-    Ok(out)
+    Ok(Some(out))
+}
+
+/// Preserve unfamiliar syntax, replacing only a leading source line number.
+fn passthrough_code(line: &str) -> String {
+    let line = line.trim();
+    if line.starts_with(['N', 'n']) {
+        let rest = line[1..].trim_start();
+        let number_len = rest.bytes().take_while(|c| c.is_ascii_digit()).count();
+        if number_len > 0 {
+            return rest[number_len..].trim_start().to_owned();
+        }
+    }
+    line.to_owned()
 }
 
 struct Parser {
@@ -331,6 +350,18 @@ pub fn parse(original: &str, opts: ParseOptions) -> Result<Program> {
             saw_nonblank = true;
         }
         let w = words(line).with_context(|| format!("Line {}", source + 1))?;
+        let Some(w) = w else {
+            p.push_block(
+                source,
+                passthrough_code(line),
+                Vec::new(),
+                false,
+                TimeParts::default(),
+                false,
+            )
+            .with_context(|| format!("Line {}", source + 1))?;
+            continue;
+        };
         if w.is_empty() {
             continue;
         }
@@ -370,18 +401,12 @@ pub fn parse(original: &str, opts: ParseOptions) -> Result<Program> {
 
 impl Parser {
     fn process(&mut self, w: &[Word], source: usize) -> Result<()> {
-        validate_modal_groups(w)?;
-        let get = |letter| w.iter().find(|w| w.letter == letter).map(|w| w.value);
-        for letter in "XYZIJKRFPST".chars() {
-            ensure!(
-                w.iter().filter(|w| w.letter == letter).count() <= 1,
-                "duplicate {letter} word"
-            );
-        }
         let mut dwell = false;
         let mut machine = false;
         let mut no_motion = false;
         let mut end = false;
+        let mut unmodelled = false;
+        let mut unmodelled_g = false;
         for word in w {
             match word.letter {
                 'G' => match word.value {
@@ -405,10 +430,10 @@ impl Parser {
                         self.motion = 80;
                         no_motion = true;
                     }
-                    _ => bail!(
-                        "G{} is not supported by the XY preview/processor; revise the CAM post rather than approximating it",
-                        word.value
-                    ),
+                    _ => {
+                        unmodelled = true;
+                        unmodelled_g = true;
+                    }
                 },
                 'M' => match word.value {
                     3.0 => self.spindle = true,
@@ -419,15 +444,34 @@ impl Parser {
                         source + 1
                     )),
                     6.0 | 7.0 | 8.0 | 9.0 => {}
-                    _ => bail!(
-                        "M{} is not supported (torch control uses M3/M5)",
-                        word.value
-                    ),
+                    _ => unmodelled = true,
                 },
                 'X' | 'Y' | 'Z' | 'I' | 'J' | 'K' | 'R' | 'F' | 'P' | 'S' | 'T' => {}
-                _ => bail!("{} words are not supported", word.letter),
+                _ => unmodelled = true,
             }
         }
+        // Unknown G codes may use axes and arc words as parameters (e.g. G10 or
+        // G81). Preserve the whole block without inventing a modal G0/G1 move.
+        // Keep their parameter precision too: these values are not ours to round.
+        let code = w
+            .iter()
+            .map(|word| {
+                if unmodelled {
+                    word.original_text.as_str()
+                } else {
+                    word.text.as_str()
+                }
+            })
+            .collect();
+        let get = |letter| {
+            w.iter().find(|w| w.letter == letter).map(|word| {
+                if unmodelled {
+                    word.original_value
+                } else {
+                    word.value
+                }
+            })
+        };
         if let Some(f) = get('F') {
             ensure!(f > 0.0, "feed must be positive");
             self.feed = f * self.unit;
@@ -435,6 +479,17 @@ impl Parser {
         if let Some(s) = get('S') {
             ensure!(s >= 0.0, "spindle speed must be nonnegative");
             self.speed = s;
+        }
+        if unmodelled_g {
+            self.push_block(source, code, Vec::new(), false, TimeParts::default(), end)?;
+            return Ok(());
+        }
+        validate_modal_groups(w)?;
+        for letter in "XYZIJKRFPST".chars() {
+            ensure!(
+                w.iter().filter(|w| w.letter == letter).count() <= 1,
+                "duplicate {letter} word"
+            );
         }
         let start = self.position;
         let mut target = start;
@@ -463,9 +518,12 @@ impl Parser {
             && (get('X').is_some()
                 || get('Y').is_some()
                 || get('Z').is_some()
-                || matches!(self.motion, 2 | 3) && (get('I').is_some() || get('J').is_some()));
+                || !unmodelled
+                    && matches!(self.motion, 2 | 3)
+                    && (get('I').is_some() || get('J').is_some()));
         ensure!(
-            matches!(self.motion, 2 | 3)
+            unmodelled && !movement
+                || matches!(self.motion, 2 | 3)
                 || get('I').is_none()
                     && get('J').is_none()
                     && get('K').is_none()
@@ -579,8 +637,18 @@ impl Parser {
             }
             self.position = target;
         }
-        // M2/M30 stop the torch, but after any motion on the same block.
-        let code: String = w.iter().map(|w| w.text.as_str()).collect();
+        self.push_block(source, code, path, rapid, time, end)
+    }
+
+    fn push_block(
+        &mut self,
+        source: usize,
+        code: String,
+        path: Vec<Point>,
+        rapid: bool,
+        time: TimeParts,
+        end: bool,
+    ) -> Result<()> {
         ensure!(
             code.len() + 16 < 240,
             "block is too long for the controller input buffer"
@@ -601,6 +669,7 @@ impl Parser {
             before: self.total,
         });
         self.total = self.total.plus(block_time);
+        // M2/M30 stop the torch, but after any motion on the same block.
         if end {
             self.spindle = false;
             self.ended = true;
@@ -718,16 +787,54 @@ mod tests {
         assert!((p.total.seconds(2.0, 1.0, 1.0) - (10.0 + 0.123456 + 1.75)).abs() < 1e-9);
     }
     #[test]
+    fn unknown_commands_are_uploaded_without_blocking_the_preview() {
+        let p = program("(CAM)\nN10 M65 P0\nG1X10F60\nM123Q2\nM64P0\nG1X20");
+        assert_eq!(
+            p.uploaded,
+            "N1M65P0\nN2G1X10F60\nN3M123Q2\nN4M64P0\nN5G1X20\n"
+        );
+        assert_eq!(p.blocks[0].source, 1);
+        assert_eq!(p.blocks[4].source, 5);
+        assert!(p.blocks[0].path.is_empty());
+        assert!(p.blocks[2].path.is_empty());
+        assert_eq!(p.total.feed, 20.0);
+        assert_eq!(program("M65P0").uploaded, "N1M65P0\n");
+    }
+    #[test]
+    fn unknown_parameters_are_preserved_without_becoming_preview_motion() {
+        let p = program("G1X10F60\nG81X1.234567Z-1R2F60\nM66I1.234567L3Q10\nG1X20");
+        assert_eq!(p.blocks[1].code, "G81X1.234567Z-1R2F60");
+        assert_eq!(p.blocks[2].code, "M66I1.234567L3Q10");
+        assert!(p.blocks[1].path.is_empty());
+        assert!(p.blocks[2].path.is_empty());
+        assert_eq!(p.total.feed, 20.0);
+
+        let p = program("G0X10\nG3X0Y10I-10J0F600\nM66I0L3Q10\nG1X20");
+        assert!(p.blocks[2].path.is_empty());
+
+        let p = program("G93G1X1F60\nG1X2");
+        assert!(p.blocks[0].path.is_empty());
+        assert_eq!(p.total.feed, 2.0);
+    }
+    #[test]
+    fn unknown_m_code_keeps_known_motion_on_the_same_block() {
+        let p = program("G1X1.234567F60M65P0\nX10");
+        assert_eq!(p.uploaded, "N1G1X1.234567F60M65P0\nN2X10\n");
+        assert_eq!(p.blocks[0].path.last().unwrap().x, 1.234567);
+        assert_eq!(p.blocks[0].time.feed, 1.234567);
+        assert_eq!(p.total.feed, 10.0);
+    }
+    #[test]
+    fn unfamiliar_syntax_is_preserved_for_fluidnc() {
+        let p = program("G1X10F60\nN50 G1 X#1 ; expression\nG1X20");
+        assert_eq!(p.uploaded, "N1G1X10F60\nN2G1 X#1 ; expression\nN3G1X20\n");
+        assert_eq!(p.blocks[1].source, 1);
+        assert!(p.blocks[1].path.is_empty());
+        assert_eq!(p.total.feed, 20.0);
+    }
+    #[test]
     fn rejects_ambiguous_input_instead_of_rewriting() {
-        for s in [
-            "G1X#1F60",
-            "G18G2X2I1F60",
-            "G1X1",
-            "G2X10R1F60",
-            "G1X1(comment",
-            "G1X1X2F60",
-            "G93G1X1F60",
-        ] {
+        for s in ["G1X1", "G2X10R1F60", "G1X1(comment", "G1X1X2F60"] {
             assert!(parse(s, ParseOptions::default()).is_err(), "{s}");
         }
     }
@@ -801,7 +908,6 @@ mod tests {
         assert!(p.uploaded.contains("I-2.121J-2.121K0F1500.000"));
         assert!((p.blocks.last().unwrap().path.last().unwrap().x - 19.9).abs() < 1e-9);
         assert!(parse("G1X1K0F60", ParseOptions::default()).is_err());
-        assert!(parse("G81X1Z-1R2F60", ParseOptions::default()).is_err());
     }
     #[test]
     fn compact_positions_and_g_codes_keep_other_precision() {
